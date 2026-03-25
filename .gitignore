@@ -36,7 +36,9 @@ perpetual_futures_data/
 
 # Output charts / images
 eval_chart_*.png
+*.png
 
 # Logs
 *.log
 logs/
+*.png

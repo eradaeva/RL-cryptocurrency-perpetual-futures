@@ -1,114 +1,160 @@
+"""
+sol_env.py
+==========
+Perpetual-futures trading environment — committed position manager.
+
+The agent operates like a disciplined position trader:
+
+  FLAT state    Reads market signals. Decides direction, risk %, SL and TP.
+                If uncertain → outputs direction in (-0.33, +0.33) → stays flat.
+                If decided   → enters trade, transitions to IN_TRADE.
+
+  IN_TRADE      Position is LOCKED. Actions are ignored.
+                Exits on:  SL hit  |  TP hit  |  max_trade_duration elapsed.
+                On exit    → returns to FLAT.
+
+──────────────────────────────────────────────────────────────────────────────
+Action space  Box(4,)   — always emitted, only read when FLAT
+
+  action[0]   direction signal    [-1.0, +1.0]
+              < -0.33  →  SHORT
+              > +0.33  →  LONG
+              else     →  FLAT  (stay out)
+
+  action[1]   risk_pct            [0.5, 5.0]   % of equity to risk per trade
+  action[2]   sl_atr_mult         [1.5, 5.0]   ATR multiples for stop-loss
+  action[3]   tp_atr_mult         [1.5, 10.0]  ATR multiples for take-profit
+
+──────────────────────────────────────────────────────────────────────────────
+Position sizing  (risk-based, automatic)
+
+  risk_amount   = (risk_pct / 100) × equity
+  sl_distance   = sl_atr_mult × ATR              (price units)
+  sl_fraction   = sl_distance / entry_price       (as fraction)
+  position_size = (risk_pct/100) / sl_fraction    (leverage ×)
+  → capped at max_leverage (default 3.0×)
+
+  Consequence: high ATR → wide SL required → position auto-shrinks.
+               The agent cannot accidentally over-leverage in volatile markets.
+
+──────────────────────────────────────────────────────────────────────────────
+Observation  (window_size × 16  +  8 portfolio scalars)
+
+  Market window (16 features per bar):
+    close_norm, rsi_14, atr_14, volatility_20, log_returns, momentum_pct,
+    last_funding_rate, funding_cost_annualized,
+    price_vs_sma200, price_vs_sma20, bb_pct, bb_width,
+    macd_hist, volume_zscore, funding_rate_zscore, basis_pct
+
+  Portfolio scalars (8):
+    position            current leveraged position (0 when flat)
+    norm_equity         equity / initial_equity
+    trade_state         0 = FLAT, 1 = IN_TRADE
+    steps_in_trade_norm steps held / max_trade_duration  (0→1)
+    unrealized_pnl_norm (equity - entry_equity) / entry_equity / risk_fraction
+                        → how many R multiples is the current trade up/down
+    consec_wins_norm    consecutive winning trades / 10  (capped)
+    consec_losses_norm  consecutive losing trades  / 10  (capped)
+    current_risk_norm   trade_risk_pct / 5.0  (0 when flat)
+
+──────────────────────────────────────────────────────────────────────────────
+Reward
+
+  Step-level
+    base_return          log(equity_t / equity_{t-1})   ← fees already in equity
+    +2×STEP_SCALE        position aligned with SMA-200 regime (per step)
+    +4×STEP_SCALE        running 50-step Sharpe > 1.5  (consistency)
+    -8× excess_dd        drawdown above 30% threshold
+
+  Trade-close  (fired once when SL / TP / timeout)
+    ±TRADE_SCALE × R     R-multiple of trade:  win=+, loss=−
+                         R = (equity_exit − equity_entry) /
+                             equity_entry / (risk_pct/100)
+    Capped: R ∈ [−3, +5]
+    streak_penalty       -2×STEP if 3+ consecutive losses
+    streak_bonus         +2×STEP if 3+ consecutive wins
+
+  No churn penalties — commitment is enforced structurally (IN_TRADE lock).
+──────────────────────────────────────────────────────────────────────────────
+"""
+
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 
 
+# State constants
+FLAT     = 0
+IN_TRADE = 1
+
+# Direction constants
+DIR_SHORT = -1
+DIR_FLAT  =  0
+DIR_LONG  =  1
+
+# Direction thresholds on action[0]
+SHORT_THRESHOLD = -0.33
+LONG_THRESHOLD  =  0.33
+
+
 class SolPerpEnv(gym.Env):
-    """
-    Perpetual-futures trading environment for PPO.
-
-    Action space (3D continuous):
-        action[0]  target position  [-1, +1]  (scaled by max_leverage)
-        action[1]  stop-loss ATR multiplier   [0.5, 5.0]
-        action[2]  take-profit ATR multiplier [0.5, 10.0]
-
-    Observation (window_size × 16 features + 6 portfolio scalars):
-        Market window features (16):
-            close, rsi_14, atr_14, volatility_20, log_returns, momentum_pct,
-            last_funding_rate, funding_cost_annualized,
-            price_vs_sma200, price_vs_sma20, bb_pct, bb_width,
-            macd_hist, volume_zscore, funding_rate_zscore, basis_pct
-
-        Portfolio scalars (6):
-            position, norm_equity, norm_consec_profit,
-            sl_active, entry_price_norm, running_sharpe_20
-
-    Reward — tiered scale (STEP_SCALE = 0.001):
-        Base  : log equity return  (fees already deducted from equity)
-
-        BONUSES
-        +8×   : running 100-step Sharpe > 2.0  (consistency)
-        +4×   : ≥10 consecutive profitable steps (streak)
-        +2×   : position aligned with SMA-200 regime
-        +1×   : take-profit hit naturally
-
-        PENALTIES
-        -8×·dd: drawdown excess above 30% threshold
-        -4×   : stop-loss triggered
-        -1×   : quadratic position-size penalty (λ=0.005)
-        -0.5× : funding drag when not regime-aligned
-
-        ANTI-CHURN  (3-layer system — the main overtrading fix)
-        Layer A — Fee drag amplifier
-            Every position change is penalised at FEE_AMPLIFIER × actual fee.
-            With FEE_AMPLIFIER=15: a full flip at $1 000 equity costs
-            2.0 × 0.0005 × 15 = 0.015 in reward, vs base_return noise ≈ 0.001.
-            The agent must expect > 1.5 % equity growth to justify each trade.
-        Layer B — Minimum hold enforcement  (MIN_HOLD_STEPS = 8 h)
-            Flipping in < 8 steps incurs a scaled penalty up to 0.010.
-            Enforces the agent to commit to a direction for at least 8 hours.
-        Layer C — Progressive flip rate  (linear above 3 flips / 24 h)
-            Each extra flip beyond 3 in a 24-step window adds 0.003 penalty.
-            At the old rate of 13 flips/day: +0.030 per step continuously.
-    """
-
     metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
         csv_path,
-        window_size=48,
-        fee_rate=0.0005,        # Binance taker fee 0.05%
-        max_leverage=2.0,
-        initial_equity=1_000.0,
-        eval_start=None,        # fixed start row for evaluation
-        eval_end=None,          # fixed end row for evaluation
+        window_size         = 48,
+        fee_rate            = 0.0005,   # Binance taker 0.05 %
+        max_leverage        = 3.0,      # hard cap on position size
+        initial_equity      = 1_000.0,
+        max_trade_duration  = 48,       # hours before force-exit  ← parameterised
+        eval_start          = None,     # fixed start row for evaluation
+        eval_end            = None,     # fixed end   row for evaluation
     ):
         super().__init__()
 
         self.df = pd.read_csv(csv_path, parse_dates=["open_time"])
         self.df = self.df.reset_index(drop=True)
 
-        self.window_size    = window_size
-        self.fee_rate       = fee_rate
-        self.max_leverage   = max_leverage
-        self.initial_equity = initial_equity
-        self.eval_start     = eval_start
-        self.eval_end       = eval_end if eval_end is not None else len(self.df) - 1
+        self.window_size        = window_size
+        self.fee_rate           = fee_rate
+        self.max_leverage       = max_leverage
+        self.initial_equity     = initial_equity
+        self.max_trade_duration = max_trade_duration
+        self.eval_start         = eval_start
+        self.eval_end           = eval_end if eval_end is not None else len(self.df) - 1
 
         self.feature_cols = [
-            # Original (8)
+            # Original 8
             "close", "rsi_14", "atr_14", "volatility_20",
             "log_returns", "momentum_pct",
             "last_funding_rate", "funding_cost_annualized",
-            # New trend (2)
+            # Trend 2
             "price_vs_sma200", "price_vs_sma20",
-            # New volatility / mean-reversion (2)
+            # Volatility / mean-reversion 2
             "bb_pct", "bb_width",
-            # New momentum / sentiment (3)
+            # Momentum / sentiment 3
             "macd_hist", "volume_zscore", "funding_rate_zscore",
-            # Basis (1)
+            # Basis 1
             "basis_pct",
         ]
 
-        # Pre-compute feature index lookups
         self._atr_idx    = self.feature_cols.index("atr_14")
         self._sma200_idx = self.feature_cols.index("price_vs_sma200")
 
         self._prepare_arrays()
 
         # ── Action space ──────────────────────────────────────────────────────
-        # [target_position, sl_atr_mult, tp_atr_mult]
         self.action_space = spaces.Box(
-            low=np.array([-1.0, 0.5,  0.5], dtype=np.float32),
-            high=np.array([1.0,  5.0, 10.0], dtype=np.float32),
-            shape=(3,), dtype=np.float32,
+            low  = np.array([-1.0, 0.5, 1.5,  1.5], dtype=np.float32),
+            high = np.array([ 1.0, 5.0, 5.0, 10.0], dtype=np.float32),
+            shape=(4,), dtype=np.float32,
         )
 
         # ── Observation space ─────────────────────────────────────────────────
-        # window × features + 6 portfolio scalars
-        obs_dim = self.window_size * len(self.feature_cols) + 6
+        n_scalars = 8
+        obs_dim   = self.window_size * len(self.feature_cols) + n_scalars
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -120,6 +166,8 @@ class SolPerpEnv(gym.Env):
     def _prepare_arrays(self):
         self.features = self.df[self.feature_cols].values.astype(np.float32)
         self.prices   = self.df["close"].values.astype(np.float32)
+        self.highs    = self.df["high"].values.astype(np.float32)
+        self.lows     = self.df["low"].values.astype(np.float32)
         self.funding  = self.df["last_funding_rate"].values.astype(np.float32)
 
     # ── Reset ─────────────────────────────────────────────────────────────────
@@ -127,9 +175,7 @@ class SolPerpEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Minimum start index: need window history + valid sma_200 (200 bars)
         min_start = max(self.window_size, 200)
-
         if self.eval_start is not None:
             self.start_idx = self.eval_start
         else:
@@ -137,99 +183,170 @@ class SolPerpEnv(gym.Env):
                 low=min_start, high=len(self.df) - 2
             ))
 
-        self.idx        = self.start_idx
-        self.equity     = self.initial_equity
-        self.position   = 0.0
-        self.last_price = self.prices[self.idx]
+        self.idx         = self.start_idx
+        self.equity      = self.initial_equity
         self.peak_equity = self.equity
+        self.last_price  = self.prices[self.idx]
 
-        # Stop-loss / take-profit state
-        self.entry_price = 0.0
-        self.sl_price    = 0.0
-        self.tp_price    = 0.0
-        self.sl_active   = False
-        self.sl_hit      = False
-        self.tp_hit      = False
+        # ── Trade state machine ───────────────────────────────────────────────
+        self.trade_state      = FLAT
+        self.position         = 0.0
+        self.entry_price      = 0.0
+        self.sl_price         = 0.0
+        self.tp_price         = 0.0
+        self.trade_entry_step = 0
+        self.trade_risk_pct   = 0.0
+        self.trade_direction  = DIR_FLAT
+        self.equity_at_entry  = self.equity
 
-        # Reward tracking
-        self.consec_profit    = 0
-        self.consec_loss      = 0
-        self.return_history   = []    # last 100 step log-returns
-        self.flip_history     = []    # recent step-indices of direction flips
-        self.steps_since_flip = 0     # steps held in current direction (Layer B)
+        # ── Streak tracking (trade-level, not step-level) ─────────────────────
+        self.consec_wins   = 0
+        self.consec_losses = 0
+
+        # ── Step return history for running Sharpe ────────────────────────────
+        self.return_history = []
 
         obs  = self._get_observation()
-        info = {"equity": self.equity}
+        info = {"equity": self.equity, "trade_state": "FLAT"}
         return obs, info
 
     # ── Observation ───────────────────────────────────────────────────────────
 
     def _get_observation(self):
         start  = self.idx - self.window_size
-        window = self.features[start:self.idx].copy()   # (window, n_feat)
+        window = self.features[start : self.idx].copy()
 
-        # Normalise close price column relative to last bar
-        ref = window[-1, 0]   # close is index 0
+        # Normalise close price relative to last bar in window
+        ref = window[-1, 0]
         if ref > 0:
             window[:, 0] = window[:, 0] / ref - 1.0
 
         flat = window.flatten()
 
-        # Portfolio scalars
-        norm_equity  = self.equity / self.initial_equity
-        norm_consec  = min(self.consec_profit, 50) / 50.0
+        # ── Portfolio scalars ─────────────────────────────────────────────────
+        norm_equity      = self.equity / self.initial_equity
+        trade_state_flag = float(self.trade_state == IN_TRADE)
 
-        sl_active_f  = float(self.sl_active)
-        entry_norm   = (self.entry_price / (self.last_price + 1e-8) - 1.0) \
-                       if self.sl_active else 0.0
+        steps_in_trade      = (self.idx - self.trade_entry_step) \
+                               if self.trade_state == IN_TRADE else 0
+        steps_in_trade_norm = min(steps_in_trade / max(self.max_trade_duration, 1), 1.0)
 
-        if len(self.return_history) >= 20:
-            arr = np.array(self.return_history[-20:])
-            r_sharpe = float(np.clip(
-                arr.mean() / (arr.std() + 1e-8) * np.sqrt(8760), -3.0, 3.0
+        # Unrealized P&L in R-multiples (how many times the risked amount gained/lost)
+        if self.trade_state == IN_TRADE and self.trade_risk_pct > 0:
+            unrealized_pct      = (self.equity - self.equity_at_entry) \
+                                   / (self.equity_at_entry + 1e-8)
+            unrealized_pnl_norm = float(np.clip(
+                unrealized_pct / (self.trade_risk_pct / 100.0), -5.0, 5.0
             ))
         else:
-            r_sharpe = 0.0
+            unrealized_pnl_norm = 0.0
 
-        portfolio = np.array(
-            [self.position, norm_equity, norm_consec, sl_active_f, entry_norm, r_sharpe],
-            dtype=np.float32,
-        )
+        consec_wins_norm   = min(self.consec_wins,   10) / 10.0
+        consec_losses_norm = min(self.consec_losses, 10) / 10.0
+        current_risk_norm  = (self.trade_risk_pct / 5.0) \
+                              if self.trade_state == IN_TRADE else 0.0
+
+        portfolio = np.array([
+            self.position,
+            norm_equity,
+            trade_state_flag,
+            steps_in_trade_norm,
+            unrealized_pnl_norm,
+            consec_wins_norm,
+            consec_losses_norm,
+            current_risk_norm,
+        ], dtype=np.float32)
+
         return np.concatenate([flat, portfolio]).astype(np.float32)
 
     # ── Step ──────────────────────────────────────────────────────────────────
 
     def step(self, action):
-        target_pos = float(np.clip(action[0], -1.0, 1.0) * self.max_leverage)
-        sl_mult    = float(np.clip(action[1],  0.5,  5.0))
-        tp_mult    = float(np.clip(action[2],  0.5, 10.0))
-
         current_price = self.prices[self.idx]
-        atr_val       = float(self.features[self.idx, self._atr_idx])
+        candle_high   = self.highs[self.idx]
+        candle_low    = self.lows[self.idx]
+        atr_val       = max(float(self.features[self.idx, self._atr_idx]), 1e-6)
 
-        # ── Check SL/TP against current price ─────────────────────────────────
-        self.sl_hit = False
-        self.tp_hit = False
+        trade_fee    = 0.0
+        sl_hit       = False
+        tp_hit       = False
+        timeout_hit  = False
+        trade_closed = False
+        r_multiple   = 0.0
 
-        if self.sl_active and abs(self.position) > 0.05:
-            if self.position > 0:                           # long
-                if current_price <= self.sl_price:
-                    self.sl_hit = True;  target_pos = 0.0
-                elif current_price >= self.tp_price:
-                    self.tp_hit = True;  target_pos = 0.0
-            else:                                           # short
-                if current_price >= self.sl_price:
-                    self.sl_hit = True;  target_pos = 0.0
-                elif current_price <= self.tp_price:
-                    self.tp_hit = True;  target_pos = 0.0
+        # ── FLAT: evaluate signal, potentially enter ───────────────────────────
+        if self.trade_state == FLAT:
 
-        # ── Trade mechanics ───────────────────────────────────────────────────
-        pos_change = target_pos - self.position
-        trade_fee  = abs(pos_change) * self.equity * self.fee_rate
+            direction_signal = float(action[0])
+            risk_pct         = float(np.clip(action[1], 0.5,  5.0))
+            sl_mult          = float(np.clip(action[2], 1.5,  5.0))
+            tp_mult          = float(np.clip(action[3], 1.5, 10.0))
 
-        next_idx     = min(self.idx + 1, len(self.df) - 1)
-        next_price   = self.prices[next_idx]
-        price_return = (next_price - current_price) / (current_price + 1e-8)
+            if direction_signal < SHORT_THRESHOLD:
+                direction = DIR_SHORT
+            elif direction_signal > LONG_THRESHOLD:
+                direction = DIR_LONG
+            else:
+                direction = DIR_FLAT   # agent chose to stay out
+
+            if direction != DIR_FLAT:
+                # Risk-based position sizing
+                sl_distance   = sl_mult * atr_val
+                sl_fraction   = sl_distance / (current_price + 1e-6)
+                risk_fraction = risk_pct / 100.0
+                position_size = min(
+                    risk_fraction / (sl_fraction + 1e-8),
+                    self.max_leverage,
+                )
+
+                self.position         = direction * position_size
+                self.entry_price      = current_price
+                self.equity_at_entry  = self.equity
+                self.trade_risk_pct   = risk_pct
+                self.trade_direction  = direction
+                self.trade_entry_step = self.idx
+                self.trade_state      = IN_TRADE
+
+                if direction == DIR_LONG:
+                    self.sl_price = current_price - sl_distance
+                    self.tp_price = current_price + tp_mult * atr_val
+                else:
+                    self.sl_price = current_price + sl_distance
+                    self.tp_price = current_price - tp_mult * atr_val
+
+                # Entry fee
+                trade_fee = abs(self.position) * self.equity * self.fee_rate
+
+        # ── IN_TRADE: check exit conditions (actions ignored) ─────────────────
+        elif self.trade_state == IN_TRADE:
+
+            steps_held  = self.idx - self.trade_entry_step
+
+            # Check SL/TP against candle high and low (not just close)
+            # This correctly captures intra-candle SL/TP touches
+            if self.position > 0:    # long
+                sl_hit = candle_low  <= self.sl_price
+                tp_hit = candle_high >= self.tp_price
+            else:                     # short
+                sl_hit = candle_high >= self.sl_price
+                tp_hit = candle_low  <= self.tp_price
+
+            # If both triggered in the same candle → SL takes priority (conservative)
+            if sl_hit and tp_hit:
+                tp_hit = False
+
+            timeout_hit = steps_held >= self.max_trade_duration
+
+            if sl_hit or tp_hit or timeout_hit:
+                trade_fee         = abs(self.position) * self.equity * self.fee_rate
+                self.position     = 0.0
+                self.trade_state  = FLAT
+                trade_closed      = True
+
+        # ── Price mechanics ───────────────────────────────────────────────────
+        next_idx      = min(self.idx + 1, len(self.df) - 1)
+        next_price    = self.prices[next_idx]
+        price_return  = (next_price - current_price) / (current_price + 1e-8)
 
         funding_rate    = self.funding[self.idx]
         funding_payment = self.position * self.equity * funding_rate
@@ -239,132 +356,73 @@ class SolPerpEnv(gym.Env):
         self.equity += pnl - trade_fee - funding_payment
         self.equity  = max(self.equity, 1e-6)
 
-        # ── Update SL/TP when entering a new meaningful position ──────────────
-        if abs(target_pos) > 0.05 and abs(pos_change) > 0.05:
-            sl_dist = sl_mult * max(atr_val, 1e-6)
-            tp_dist = tp_mult * max(atr_val, 1e-6)
-            self.entry_price = current_price
-            if target_pos > 0:
-                self.sl_price = current_price - sl_dist
-                self.tp_price = current_price + tp_dist
+        # ── Update trade streak on close ──────────────────────────────────────
+        if trade_closed and self.trade_risk_pct > 0:
+            trade_pnl_pct = (self.equity - self.equity_at_entry) \
+                             / (self.equity_at_entry + 1e-8)
+            r_multiple    = trade_pnl_pct / (self.trade_risk_pct / 100.0)
+            if self.equity > self.equity_at_entry:
+                self.consec_wins   += 1
+                self.consec_losses  = 0
             else:
-                self.sl_price = current_price + sl_dist
-                self.tp_price = current_price - tp_dist
-            self.sl_active = True
-        elif abs(target_pos) <= 0.05:
-            self.sl_active   = False
-            self.entry_price = 0.0
+                self.consec_wins    = 0
+                self.consec_losses += 1
 
         # ── Advance state ─────────────────────────────────────────────────────
-        prev_sign     = np.sign(self.position)
-        self.position = target_pos
-        self.idx      = next_idx
+        self.idx        = next_idx
         self.last_price = next_price
-
-        # Track direction flips
-        new_sign  = np.sign(target_pos)
-        is_flip   = (prev_sign != new_sign and
-                     (abs(prev_sign) > 0 or abs(new_sign) > 0))
-        if is_flip:
-            self.flip_history.append(self.idx)
-            self.steps_since_flip = 0
-        else:
-            self.steps_since_flip += 1
-        # Prune flip records older than 48 steps
-        self.flip_history = [f for f in self.flip_history if self.idx - f <= 48]
 
         # ── Drawdown tracking ─────────────────────────────────────────────────
         if self.equity > self.peak_equity:
             self.peak_equity = self.equity
         current_drawdown = (self.peak_equity - self.equity) / (self.peak_equity + 1e-8)
 
-        # ── Base reward ───────────────────────────────────────────────────────
+        # ── Reward ────────────────────────────────────────────────────────────
         base_return = np.log(self.equity / (old_equity + 1e-8))
 
-        # Update return history
         self.return_history.append(base_return)
         if len(self.return_history) > 100:
             self.return_history.pop(0)
 
-        # Update consecutive streak
-        step_pnl = pnl - trade_fee - funding_payment
-        if step_pnl > 0:
-            self.consec_profit += 1
-            self.consec_loss    = 0
-        else:
-            self.consec_profit  = 0
-            self.consec_loss   += 1
-
-        # ── Tiered reward ─────────────────────────────────────────────────────
-        STEP_SCALE = 0.001
+        STEP_SCALE  = 0.001
+        TRADE_SCALE = 0.015
         bonus   = 0.0
         penalty = 0.0
 
-        # +8×: Running 100-step Sharpe > 2.0 (consistency reward)
-        if len(self.return_history) >= 100:
-            ret_arr        = np.array(self.return_history)
-            running_sharpe = ret_arr.mean() / (ret_arr.std() + 1e-8) * np.sqrt(8760)
-            if running_sharpe > 2.0:
-                bonus += 8 * STEP_SCALE
-
-        # +4×: Consecutive profitable streak (≥10 steps)
-        if self.consec_profit >= 10:
-            bonus += 4 * STEP_SCALE
-
-        # +2×: Regime alignment — long above SMA-200, short below
-        price_vs_sma200  = float(self.features[self.idx, self._sma200_idx])
-        above_sma200     = price_vs_sma200 > 0
-        regime_aligned   = (
+        # Regime alignment: long above SMA-200, short below (only while in trade)
+        price_vs_sma200 = float(self.features[self.idx, self._sma200_idx])
+        above_sma200    = price_vs_sma200 > 0
+        regime_aligned  = (
             (self.position >  0.05 and     above_sma200) or
             (self.position < -0.05 and not above_sma200)
         )
         if regime_aligned:
             bonus += 2 * STEP_SCALE
 
-        # +1×: Take-profit hit
-        if self.tp_hit:
-            bonus += 1 * STEP_SCALE
+        # Running Sharpe consistency bonus (last 50 steps)
+        if len(self.return_history) >= 50:
+            arr    = np.array(self.return_history)
+            sharpe = arr.mean() / (arr.std() + 1e-8) * np.sqrt(8760)
+            if sharpe > 1.5:
+                bonus += 4 * STEP_SCALE
 
-        # -8×·excess_dd: Drawdown above 30% threshold
+        # Drawdown penalty
         excess_dd = max(0.0, current_drawdown - 0.30)
         penalty  += 8.0 * excess_dd
 
-        # -4×: Stop-loss hit
-        if self.sl_hit:
-            penalty += 4 * STEP_SCALE
+        # Trade-close: R-multiple calibration signal
+        if trade_closed:
+            r_clipped = float(np.clip(r_multiple, -3.0, 5.0))
+            if r_clipped >= 0:
+                bonus   += TRADE_SCALE * r_clipped
+            else:
+                penalty += TRADE_SCALE * abs(r_clipped)
 
-        # ── Anti-churn  (3 layers) ────────────────────────────────────────────
-        FEE_AMPLIFIER  = 15.0    # Layer A: explicit fee signal multiplier
-        MIN_HOLD_STEPS = 8       # Layer B: minimum hold before penalty-free flip
-        FLIP_THRESHOLD = 3       # Layer C: free flips per 24-step window
-        FLIP_RATE_COST = 0.003   # Layer C: penalty per extra flip above threshold
-
-        # Layer A — fee drag amplifier
-        # Penalise EVERY position change at 15× the actual fee cost.
-        # Forces the agent to expect > 1.5 % equity growth to justify a trade.
-        penalty += abs(pos_change) * self.fee_rate * FEE_AMPLIFIER
-
-        # Layer B — minimum hold enforcement
-        # If the agent flips before holding for MIN_HOLD_STEPS, scale a penalty
-        # proportional to how early the flip happened (0 → 1 as hold → 0).
-        if is_flip and 0 < self.steps_since_flip < MIN_HOLD_STEPS:
-            early_frac = (MIN_HOLD_STEPS - self.steps_since_flip) / MIN_HOLD_STEPS
-            penalty   += 0.010 * early_frac
-
-        # Layer C — progressive flip rate
-        # Each flip beyond FLIP_THRESHOLD in the last 24 steps adds a flat cost.
-        # Old rate: 13 flips/day → +0.030/step continuously.
-        # Target rate: ≤ 4 flips/day → +0.003/step (manageable).
-        recent_flips_24h = sum(1 for f in self.flip_history if self.idx - f <= 24)
-        if recent_flips_24h > FLIP_THRESHOLD:
-            penalty += FLIP_RATE_COST * (recent_flips_24h - FLIP_THRESHOLD)
-
-        # -1×: Quadratic position-size penalty
-        penalty += 0.005 * (self.position ** 2)
-
-        # -0.5×: Funding drag when not regime-aligned
-        if abs(self.position) > 0.05 and not regime_aligned:
-            penalty += 0.5 * abs(funding_payment / (old_equity + 1e-8))
+            # Streak signals
+            if self.consec_losses >= 3:
+                penalty += 2 * STEP_SCALE   # calibration is off
+            if self.consec_wins   >= 3:
+                bonus   += 2 * STEP_SCALE   # agent is reading market well
 
         reward = base_return + bonus - penalty
         done   = self.idx >= self.eval_end
@@ -378,18 +436,25 @@ class SolPerpEnv(gym.Env):
             "trade_fee":        trade_fee,
             "funding_payment":  funding_payment,
             "drawdown":         current_drawdown,
-            "sl_hit":           self.sl_hit,
-            "tp_hit":           self.tp_hit,
+            "sl_hit":           sl_hit,
+            "tp_hit":           tp_hit,
+            "timeout_hit":      timeout_hit,
+            "trade_closed":     trade_closed,
+            "r_multiple":       r_multiple,
             "regime_aligned":   regime_aligned,
+            "trade_state":      "IN_TRADE" if self.trade_state == IN_TRADE else "FLAT",
+            "trade_risk_pct":   self.trade_risk_pct if self.trade_state == IN_TRADE else 0.0,
         }
         return obs, reward, done, False, info
 
     # ── Render ────────────────────────────────────────────────────────────────
 
     def render(self):
+        state = "IN_TRADE" if self.trade_state == IN_TRADE else "FLAT    "
         print(
-            f"t={self.idx}  price={self.last_price:.4f}  "
-            f"equity={self.equity:.2f}  pos={self.position:.3f}  "
-            f"sl_active={self.sl_active}  "
-            f"sl={self.sl_price:.4f}  tp={self.tp_price:.4f}"
+            f"t={self.idx}  price={self.last_price:>8.2f}  "
+            f"equity={self.equity:>8.2f}  pos={self.position:>+6.3f}  "
+            f"state={state}  "
+            f"sl={self.sl_price:>8.2f}  tp={self.tp_price:>8.2f}  "
+            f"W={self.consec_wins}  L={self.consec_losses}"
         )
