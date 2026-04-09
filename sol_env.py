@@ -6,7 +6,7 @@ Perpetual-futures trading environment — committed position manager.
 The agent operates like a disciplined position trader:
 
   FLAT state    Reads market signals. Decides direction, risk %, SL and TP.
-                If uncertain → outputs direction in (-0.33, +0.33) → stays flat.
+                If uncertain → outputs direction in (-0.50, +0.50) → stays flat.
                 If decided   → enters trade, transitions to IN_TRADE.
 
   IN_TRADE      Position is LOCKED. Actions are ignored.
@@ -17,8 +17,8 @@ The agent operates like a disciplined position trader:
 Action space  Box(4,)   — always emitted, only read when FLAT
 
   action[0]   direction signal    [-1.0, +1.0]
-              < -0.33  →  SHORT
-              > +0.33  →  LONG
+              < -0.50  →  SHORT
+              > +0.50  →  LONG
               else     →  FLAT  (stay out)
 
   action[1]   risk_pct            [0.5, 5.0]   % of equity to risk per trade
@@ -38,13 +38,14 @@ Position sizing  (risk-based, automatic)
                The agent cannot accidentally over-leverage in volatile markets.
 
 ──────────────────────────────────────────────────────────────────────────────
-Observation  (window_size × 16  +  8 portfolio scalars)
+Observation  (window_size × 20  +  8 portfolio scalars)
 
-  Market window (16 features per bar):
+  Market window (20 features per bar):
     close_norm, rsi_14, atr_14, volatility_20, log_returns, momentum_pct,
     last_funding_rate, funding_cost_annualized,
     price_vs_sma200, price_vs_sma20, bb_pct, bb_width,
-    macd_hist, volume_zscore, funding_rate_zscore, basis_pct
+    macd_hist, volume_zscore, funding_rate_zscore, basis_pct,
+    donchian_pct, donchian_width, atr_ratio, price_vs_sma500
 
   Portfolio scalars (8):
     position            current leveraged position (0 when flat)
@@ -62,9 +63,11 @@ Reward
 
   Step-level
     base_return          log(equity_t / equity_{t-1})   ← fees already in equity
-    +2×STEP_SCALE        position aligned with SMA-200 regime (per step)
+    +2×STEP_SCALE        position aligned with SMA-200 AND SMA-500 (strong regime)
     +4×STEP_SCALE        running 50-step Sharpe > 1.5  (consistency)
+    +0.5×STEP_SCALE      flat patience: tiny bonus for staying out (reduces overtrading)
     -8× excess_dd        drawdown above 30% threshold
+    -fee_penalty         6× fee rate on entry (makes trading cost salient)
 
   Trade-close  (fired once when SL / TP / timeout)
     ±TRADE_SCALE × R     R-multiple of trade:  win=+, loss=−
@@ -74,7 +77,10 @@ Reward
     streak_penalty       -2×STEP if 3+ consecutive losses
     streak_bonus         +2×STEP if 3+ consecutive wins
 
-  No churn penalties — commitment is enforced structurally (IN_TRADE lock).
+  Structural constraints
+    TP ≥ 2× SL distance  (2:1 R:R floor — even 40% WR is profitable)
+    min_hold_steps       SL/TP cannot fire before N candles (default 12h)
+    Commitment is enforced structurally (IN_TRADE lock).
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -94,8 +100,8 @@ DIR_FLAT  =  0
 DIR_LONG  =  1
 
 # Direction thresholds on action[0]
-SHORT_THRESHOLD = -0.33
-LONG_THRESHOLD  =  0.33
+SHORT_THRESHOLD = -0.5
+LONG_THRESHOLD  =  0.5
 
 
 class SolPerpEnv(gym.Env):
@@ -109,6 +115,8 @@ class SolPerpEnv(gym.Env):
         max_leverage        = 3.0,      # hard cap on position size
         initial_equity      = 1_000.0,
         max_trade_duration  = 48,       # hours before force-exit  ← parameterised
+        min_hold_steps      = 12,       # candles before SL/TP can fire (default 12h)
+        train_end_date      = None,     # "YYYY-MM-DD" — episodes end here during training
         eval_start          = None,     # fixed start row for evaluation
         eval_end            = None,     # fixed end   row for evaluation
     ):
@@ -122,8 +130,17 @@ class SolPerpEnv(gym.Env):
         self.max_leverage       = max_leverage
         self.initial_equity     = initial_equity
         self.max_trade_duration = max_trade_duration
+        self.min_hold_steps     = min_hold_steps
         self.eval_start         = eval_start
         self.eval_end           = eval_end if eval_end is not None else len(self.df) - 1
+
+        # Compute the training boundary row index
+        if train_end_date is not None:
+            end_dt = pd.Timestamp(train_end_date)
+            mask   = self.df["open_time"] <= end_dt
+            self.train_end_idx = int(mask.sum()) - 1
+        else:
+            self.train_end_idx = None
 
         self.feature_cols = [
             # Original 8
@@ -138,10 +155,15 @@ class SolPerpEnv(gym.Env):
             "macd_hist", "volume_zscore", "funding_rate_zscore",
             # Basis 1
             "basis_pct",
+            # New: channel position, volatility regime, long-term trend
+            "donchian_pct", "donchian_width",
+            "atr_ratio",
+            "price_vs_sma500",
         ]
 
         self._atr_idx    = self.feature_cols.index("atr_14")
         self._sma200_idx = self.feature_cols.index("price_vs_sma200")
+        self._sma500_idx = self.feature_cols.index("price_vs_sma500")
 
         self._prepare_arrays()
 
@@ -175,13 +197,33 @@ class SolPerpEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        min_start = max(self.window_size, 200)
+        # Need at least 500 bars for SMA-500 warmup
+        min_start = max(self.window_size, 500)
+
         if self.eval_start is not None:
-            self.start_idx = self.eval_start
+            # Evaluation mode: fixed start, episode runs to eval_end
+            self.start_idx    = self.eval_start
+            self._episode_end = self.eval_end
         else:
-            self.start_idx = int(self.np_random.integers(
-                low=min_start, high=len(self.df) - 2
-            ))
+            # Training mode: episode ends at train_end_idx (if set)
+            upper_bound       = (self.train_end_idx
+                                 if self.train_end_idx is not None
+                                 else len(self.df) - 2)
+            self._episode_end = upper_bound
+
+            # Balanced bull/bear episode sampling (50/50)
+            sma200_vals  = self.features[min_start:upper_bound, self._sma200_idx]
+            bull_offsets = np.where(sma200_vals >  0)[0]
+            bear_offsets = np.where(sma200_vals <= 0)[0]
+
+            if len(bull_offsets) > 0 and len(bear_offsets) > 0:
+                if self.np_random.random() < 0.5:
+                    offset = int(self.np_random.choice(bull_offsets))
+                else:
+                    offset = int(self.np_random.choice(bear_offsets))
+                self.start_idx = min_start + offset
+            else:
+                self.start_idx = int(self.np_random.integers(min_start, upper_bound))
 
         self.idx         = self.start_idx
         self.equity      = self.initial_equity
@@ -198,6 +240,7 @@ class SolPerpEnv(gym.Env):
         self.trade_risk_pct   = 0.0
         self.trade_direction  = DIR_FLAT
         self.equity_at_entry  = self.equity
+        self.just_entered     = False   # fee-penalty flag: True on entry candle
 
         # ── Streak tracking (trade-level, not step-level) ─────────────────────
         self.consec_wins   = 0
@@ -291,7 +334,10 @@ class SolPerpEnv(gym.Env):
 
             if direction != DIR_FLAT:
                 # Risk-based position sizing
-                sl_distance   = sl_mult * atr_val
+                sl_distance = sl_mult * atr_val
+                # Enforce 2:1 TP:SL minimum (floor TP at 2× SL distance)
+                tp_distance = max(tp_mult * atr_val, 2.0 * sl_distance)
+
                 sl_fraction   = sl_distance / (current_price + 1e-6)
                 risk_fraction = risk_pct / 100.0
                 position_size = min(
@@ -306,13 +352,14 @@ class SolPerpEnv(gym.Env):
                 self.trade_direction  = direction
                 self.trade_entry_step = self.idx
                 self.trade_state      = IN_TRADE
+                self.just_entered     = True   # fires fee penalty this step
 
                 if direction == DIR_LONG:
                     self.sl_price = current_price - sl_distance
-                    self.tp_price = current_price + tp_mult * atr_val
+                    self.tp_price = current_price + tp_distance
                 else:
                     self.sl_price = current_price + sl_distance
-                    self.tp_price = current_price - tp_mult * atr_val
+                    self.tp_price = current_price - tp_distance
 
                 # Entry fee
                 trade_fee = abs(self.position) * self.equity * self.fee_rate
@@ -320,7 +367,7 @@ class SolPerpEnv(gym.Env):
         # ── IN_TRADE: check exit conditions (actions ignored) ─────────────────
         elif self.trade_state == IN_TRADE:
 
-            steps_held  = self.idx - self.trade_entry_step
+            steps_held = self.idx - self.trade_entry_step
 
             # Check SL/TP against candle high and low (not just close)
             # This correctly captures intra-candle SL/TP touches
@@ -330,6 +377,11 @@ class SolPerpEnv(gym.Env):
             else:                     # short
                 sl_hit = candle_high >= self.sl_price
                 tp_hit = candle_low  <= self.tp_price
+
+            # Minimum holding period: SL/TP cannot fire before min_hold_steps
+            if steps_held < self.min_hold_steps:
+                sl_hit = False
+                tp_hit = False
 
             # If both triggered in the same candle → SL takes priority (conservative)
             if sl_hit and tp_hit:
@@ -389,15 +441,28 @@ class SolPerpEnv(gym.Env):
         bonus   = 0.0
         penalty = 0.0
 
-        # Regime alignment: long above SMA-200, short below (only while in trade)
+        # Regime alignment: reward only when both SMA-200 AND SMA-500 agree
         price_vs_sma200 = float(self.features[self.idx, self._sma200_idx])
+        price_vs_sma500 = float(self.features[self.idx, self._sma500_idx])
         above_sma200    = price_vs_sma200 > 0
+        above_sma500    = price_vs_sma500 > 0
+        strong_bull     = above_sma200 and above_sma500
+        strong_bear     = (not above_sma200) and (not above_sma500)
         regime_aligned  = (
-            (self.position >  0.05 and     above_sma200) or
-            (self.position < -0.05 and not above_sma200)
+            (self.position >  0.05 and strong_bull) or
+            (self.position < -0.05 and strong_bear)
         )
         if regime_aligned:
             bonus += 2 * STEP_SCALE
+
+        # Flat patience: tiny positive for staying out (discourages overtrading)
+        if self.trade_state == FLAT and not self.just_entered:
+            bonus += 0.5 * STEP_SCALE
+
+        # Per-trade fee penalty: makes entry cost salient to the policy
+        if self.just_entered:
+            penalty += abs(self.position) * self.fee_rate * 6.0
+            self.just_entered = False
 
         # Running Sharpe consistency bonus (last 50 steps)
         if len(self.return_history) >= 50:
@@ -425,7 +490,7 @@ class SolPerpEnv(gym.Env):
                 bonus   += 2 * STEP_SCALE   # agent is reading market well
 
         reward = base_return + bonus - penalty
-        done   = self.idx >= self.eval_end
+        done   = self.idx >= self._episode_end
 
         obs  = self._get_observation()
         info = {

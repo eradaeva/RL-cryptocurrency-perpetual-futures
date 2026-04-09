@@ -9,7 +9,7 @@ Data fetched per asset:
   - Real funding rates        (/fapi/v1/fundingRate)
   - Spot OHLCV for basis     (/api/v3/klines)
 
-Output columns (31):
+Output columns (36):
   open_time, open, high, low, close,
   volume, quote_volume, taker_buy_volume, taker_buy_quote_volume,
   volume_ratio_taker,
@@ -18,7 +18,9 @@ Output columns (31):
   log_returns, momentum_pct, price_range_pct,
   basis, basis_pct,
   sma_200, ema_20, price_vs_sma200, price_vs_sma20,
-  bb_width, bb_pct, macd_hist, volume_zscore, funding_rate_zscore
+  bb_width, bb_pct, macd_hist, volume_zscore, funding_rate_zscore,
+  sma_500, price_vs_sma500,
+  donchian_pct, donchian_width, atr_ratio
 
 Usage:
     python perpetual_futures_data_pipeline.py
@@ -253,6 +255,24 @@ class PerpetualFuturesDataPipeline:
             (fr - fr.rolling(48).mean()) / (fr_std + 1e-10)
         ).clip(-4.0, 4.0)
 
+        # ── SMA-500 long-term trend ───────────────────────────────────────────
+        df["sma_500"]         = close.rolling(500).mean()
+        df["price_vs_sma500"] = (close / df["sma_500"] - 1).clip(-1.0, 1.0)
+
+        # ── Donchian channels (20-period) ─────────────────────────────────────
+        donchian_high        = df["high"].rolling(20).max()
+        donchian_low         = df["low"].rolling(20).min()
+        donchian_range       = donchian_high - donchian_low
+        df["donchian_pct"]   = ((close - donchian_low) /
+                                (donchian_range + 1e-10)).clip(0.0, 1.0)
+        df["donchian_width"] = (donchian_range /
+                                (close + 1e-10)).clip(0.0, 0.5)
+
+        # ── ATR regime ratio (current ATR vs 30-day average) ─────────────────
+        atr_30d_mean      = df["atr_14"].rolling(720).mean()
+        df["atr_ratio"]   = (df["atr_14"] /
+                             (atr_30d_mean + 1e-10)).clip(0.3, 3.0)
+
         return df
 
     @staticmethod
@@ -297,8 +317,8 @@ class PerpetualFuturesDataPipeline:
         # 4. Compute all indicators
         df = self.compute_indicators(df)
 
-        # 5. Drop the leading NaN rows (from rolling windows; sma_200 needs 200 bars)
-        df = df.dropna(subset=["sma_200", "rsi_14", "atr_14"])
+        # 5. Drop the leading NaN rows (sma_500 is the largest window at 500 bars)
+        df = df.dropna(subset=["sma_500", "rsi_14", "atr_14"])
         df = df.ffill().fillna(0.0)
         df = df.reset_index(drop=True)
 
@@ -316,6 +336,9 @@ class PerpetualFuturesDataPipeline:
             "sma_200", "ema_20", "price_vs_sma200", "price_vs_sma20",
             "bb_width", "bb_pct", "macd_hist",
             "volume_zscore", "funding_rate_zscore",
+            "sma_500", "price_vs_sma500",
+            "donchian_pct", "donchian_width",
+            "atr_ratio",
         ]
         df = df[[c for c in final_cols if c in df.columns]]
 
@@ -339,13 +362,10 @@ if __name__ == "__main__":
 
     # ── Configure here ────────────────────────────────────────────────────────
     START = datetime(2020, 1, 1)
-    END   = datetime(2025, 12, 31)
+    END   = datetime(2026, 4, 8)
 
     # Comment out assets you don't need
     ASSETS = [
-        "BTCUSDT",
-        "ETHUSDT",
-        "BNBUSDT",
         "SOLUSDT",
     ]
     # ─────────────────────────────────────────────────────────────────────────

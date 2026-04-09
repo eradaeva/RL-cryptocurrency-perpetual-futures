@@ -36,20 +36,87 @@ from sol_env import SolPerpEnv
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-CSV_PATH   = "SOLUSDT_perpetual_futures_processed_2020-2025.csv"
+CSV_PATH   = "SOLUSDT_perpetual_futures_processed_2020-2026.csv"
+MODEL_DIR  = Path("ppo_sol_perp")
 SEED       = 42
 FEE_RATE   = 0.0005      # Binance taker 0.05 %
 MAX_LEV    = 3.0         # must match training
+MIN_HOLD   = 12          # must match training
+
+# Train / val / test split boundaries
+TRAIN_END  = "2023-12-31"   # training data ends here (inclusive)
+VAL_END    = "2024-12-31"   # validation period ends here
+TEST_START = "2025-01-01"   # true out-of-sample test starts here
 
 PERIODS = [
-    ("Early Bull  (Sep 2020 – Jun 2021)",  "2020-09-01", "2021-06-01"),
-    ("Peak & Crash (Jun 2021 – Jun 2022)", "2021-06-01", "2022-06-01"),
-    ("Bear / FTX  (Jun 2022 – Jan 2023)",  "2022-06-01", "2023-01-01"),
-    ("Recovery    (Jan 2023 – Jan 2024)",  "2023-01-01", "2024-01-01"),
-    ("Bull Run    (Jan 2024 – Jan 2025)",  "2024-01-01", "2025-01-01"),
+    # ── In-sample (training data) ─────────────────────────────────────
+    ("[IS] Early Bull  (Sep 2020–Jun 2021)",  "2020-09-01", "2021-06-01"),
+    ("[IS] Peak & Crash(Jun 2021–Jun 2022)",  "2021-06-01", "2022-06-01"),
+    ("[IS] Bear / FTX  (Jun 2022–Jan 2023)",  "2022-06-01", "2023-01-01"),
+    ("[IS] Recovery    (Jan 2023–Jan 2024)",  "2023-01-01", "2024-01-01"),
+    # ── Validation ────────────────────────────────────────────────────
+    ("[VAL] Bull Run   (Jan 2024–Jan 2025)",  "2024-01-01", "2025-01-01"),
+    # ── Out-of-sample test ────────────────────────────────────────────
+    ("[OOS] 2025–2026  (Jan 2025–Apr 2026)",  "2025-01-01", "2026-04-08"),
 ]
 
 df_full = pd.read_csv(CSV_PATH, parse_dates=["open_time"])
+
+
+# ── Baselines ─────────────────────────────────────────────────────────────────
+
+def compute_bnh_baseline(df, eval_start, eval_end):
+    """Buy-and-hold: buy at eval_start, hold until eval_end. Returns metrics dict."""
+    prices  = df["close"].values.astype(float)
+    seg     = prices[eval_start : eval_end + 1]
+    if len(seg) < 2:
+        return None
+    equity  = 1_000.0 * seg / seg[0]
+    total_ret = (equity[-1] / equity[0]) - 1.0
+    n = len(equity)
+    HPY = 8_760
+    log_r = np.diff(np.log(equity + 1e-8))
+    sharpe = (log_r.mean() / (log_r.std() + 1e-8)) * np.sqrt(HPY)
+    peak   = np.maximum.accumulate(equity)
+    max_dd = ((peak - equity) / (peak + 1e-8)).max()
+    return dict(total_ret=total_ret, sharpe=sharpe, max_dd=max_dd,
+                label="Buy-and-Hold")
+
+
+def compute_sma_crossover_baseline(df, eval_start, eval_end):
+    """
+    SMA-20 vs SMA-50 crossover (long/flat only, no shorting).
+    Signal: long when SMA-20 > SMA-50, flat otherwise.
+    Uses pre-computed sma_20 column; SMA-50 computed on the fly.
+    """
+    prices = df["close"].values.astype(float)
+    sma20  = df["sma_20"].values.astype(float)
+    sma50  = pd.Series(prices).rolling(50).mean().values
+
+    equity = 1_000.0
+    eq_arr = []
+    HPY    = 8_760
+
+    for i in range(eval_start, eval_end):
+        p_ret    = (prices[i + 1] - prices[i]) / (prices[i] + 1e-8)
+        in_trade = (not np.isnan(sma50[i])) and (sma20[i] > sma50[i])
+        if in_trade:
+            fee    = FEE_RATE if (i == eval_start or not (
+                (not np.isnan(sma50[i-1])) and (sma20[i-1] > sma50[i-1])
+            )) else 0.0
+            equity = equity * (1 + p_ret) - fee * equity
+        eq_arr.append(equity)
+
+    if len(eq_arr) < 2:
+        return None
+    eq_arr = np.array(eq_arr)
+    total_ret = (eq_arr[-1] / eq_arr[0]) - 1.0
+    log_r = np.diff(np.log(eq_arr + 1e-8))
+    sharpe = (log_r.mean() / (log_r.std() + 1e-8)) * np.sqrt(HPY)
+    peak   = np.maximum.accumulate(eq_arr)
+    max_dd = ((peak - eq_arr) / (peak + 1e-8)).max()
+    return dict(total_ret=total_ret, sharpe=sharpe, max_dd=max_dd,
+                label="SMA Crossover (20/50)")
 
 
 # ── Model discovery ────────────────────────────────────────────────────────────
@@ -58,7 +125,7 @@ def discover_models():
     """Return sorted list of (window, duration) for every trained model found."""
     pattern = re.compile(r"ppo_sol_perp_w(\d+)_td(\d+)\.zip$")
     found   = []
-    for p in sorted(Path(".").glob("ppo_sol_perp_w*_td*.zip")):
+    for p in sorted(MODEL_DIR.glob("ppo_sol_perp_w*_td*.zip")):
         m = pattern.match(p.name)
         if m:
             found.append((int(m.group(1)), int(m.group(2))))
@@ -68,8 +135,8 @@ def discover_models():
 def model_files(window, duration):
     tag = f"w{window}_td{duration}"
     return (
-        f"ppo_sol_perp_{tag}",
-        f"vec_normalize_{tag}.pkl",
+        str(MODEL_DIR / f"ppo_sol_perp_{tag}"),
+        str(MODEL_DIR / f"vec_normalize_{tag}.pkl"),
     )
 
 
@@ -94,6 +161,7 @@ def run_episode(model, vecnorm_path, window, trade_dur, eval_start, eval_end):
             fee_rate=FEE_RATE, max_leverage=MAX_LEV,
             initial_equity=1_000.0,
             max_trade_duration=trade_dur,
+            min_hold_steps=MIN_HOLD,
             eval_start=eval_start, eval_end=eval_end,
         )
 
@@ -605,8 +673,12 @@ if __name__ == "__main__":
     models_found = discover_models()
 
     if not models_found:
-        print("No trained models found. Run train_solo_ppo.py first.")
+        print("No trained models found in ppo_sol_perp/. Run train_solo_ppo.py first.")
         raise SystemExit(1)
+
+    # Chart output directory
+    CHART_DIR = Path("evaluation pictures")
+    CHART_DIR.mkdir(exist_ok=True)
 
     print(f"\nFound {len(models_found)} models: "
           + ", ".join(f"w{w}_td{d}" for w, d in models_found))
@@ -650,29 +722,49 @@ if __name__ == "__main__":
 
             print_metrics(metrics, period_label, window, duration)
 
+            # ── Baseline comparison ───────────────────────────────────────────
+            bnh = compute_bnh_baseline(df_full, eval_start, eval_end)
+            sma = compute_sma_crossover_baseline(df_full, eval_start, eval_end)
+            print(f"  {'':─<54}")
+            print(f"  {'BASELINE COMPARISON':^54}")
+            print(f"  {'':─<54}")
+            print(f"  {'Strategy':<28} {'Return':>8} {'Sharpe':>8} {'MaxDD':>8}")
+            print(f"  {'PPO Agent':<28} {metrics['total_ret']*100:>+7.1f}% "
+                  f"{metrics['sharpe']:>8.3f} {metrics['max_dd']*100:>7.1f}%")
+            for b in [bnh, sma]:
+                if b is not None:
+                    print(f"  {b['label']:<28} {b['total_ret']*100:>+7.1f}% "
+                          f"{b['sharpe']:>8.3f} {b['max_dd']*100:>7.1f}%")
+            print(f"  {'':─<54}")
+
             safe_period = start_date[:7].replace("-", "")
             plot_episode(hist, metrics, period_label, window, duration,
-                         f"eval_chart_{tag}_{safe_period}.png")
+                         str(CHART_DIR / f"eval_chart_{tag}_{safe_period}.png"))
             plot_behaviour(hist, metrics, period_label, window, duration,
-                           f"eval_behaviour_{tag}_{safe_period}.png")
+                           str(CHART_DIR / f"eval_behaviour_{tag}_{safe_period}.png"))
 
             period_results[period_label] = metrics
+            period_results[period_label]["_bnh"] = bnh
+            period_results[period_label]["_sma"] = sma
 
         all_results[(window, duration)] = period_results
 
         # Per-model cross-period summary
         if period_results:
             print(f"\n  ── {tag} cross-period summary ──")
-            print(f"  {'Period':<36} {'Return':>9} {'Sharpe':>9} "
-                  f"{'MaxDD':>9} {'Trades':>8} {'WinRate':>9}")
-            print("  " + "─" * 84)
+            print(f"  {'Period':<36} {'PPO Ret':>9} {'PPO Sh':>8} "
+                  f"{'BnH Ret':>9} {'BnH Sh':>8} {'SMA Ret':>9} {'SMA Sh':>8}")
+            print("  " + "─" * 100)
             for lbl, m in period_results.items():
+                bnh = m.get("_bnh") or {}
+                sma = m.get("_sma") or {}
                 print(f"  {lbl[:34]:<36}"
                       f" {m['total_ret']*100:>+8.1f}%"
-                      f" {m['sharpe']:>9.3f}"
-                      f" {m['max_dd']*100:>8.1f}%"
-                      f" {m['n_trades']:>8d}"
-                      f" {m['trade_wr']*100:>8.1f}%")
+                      f" {m['sharpe']:>8.3f}"
+                      f" {bnh.get('total_ret', float('nan'))*100:>+8.1f}%"
+                      f" {bnh.get('sharpe', float('nan')):>8.3f}"
+                      f" {sma.get('total_ret', float('nan'))*100:>+8.1f}%"
+                      f" {sma.get('sharpe', float('nan')):>8.3f}")
 
     # Master comparison grid across all 16 models
     print_master_grid(all_results, models_found)

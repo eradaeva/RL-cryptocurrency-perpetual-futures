@@ -39,12 +39,17 @@ from sol_env import SolPerpEnv
 WINDOW_SIZES    = [24, 48, 96, 168]
 TRADE_DURATIONS = [24, 48, 72, 168]
 
-TOTAL_STEPS  = 2_000_000    # per model — increase to 3M for sharper convergence
-SKIP_EXISTING = True        # skip already-trained models (safe to re-run)
+TOTAL_STEPS    = 3_000_000   # per model
+SKIP_EXISTING  = True        # skip already-trained models (safe to re-run)
 
-CSV_PATH     = "SOLUSDT_perpetual_futures_processed_2020-2025.csv"
-FEE_RATE     = 0.0005
-MAX_LEVERAGE = 3.0
+CSV_PATH        = "SOLUSDT_perpetual_futures_processed_2020-2026.csv"
+TRAIN_END_DATE  = "2023-12-31"   # training data boundary (2024+ for val/test)
+FEE_RATE        = 0.0005
+MAX_LEVERAGE    = 3.0
+MIN_HOLD_STEPS  = 12             # candles before SL/TP can fire
+
+MODEL_DIR  = "ppo_sol_perp"
+LOG_DIR    = "training_log"
 
 PRINT_EVERY  = 100_000      # progress report every N training steps
 
@@ -151,9 +156,9 @@ def _fmt_time(seconds: float) -> str:
 def model_names(window: int, duration: int):
     tag = f"w{window}_td{duration}"
     return (
-        f"ppo_sol_perp_{tag}",
-        f"vec_normalize_{tag}.pkl",
-        f"training_log_{tag}.csv",
+        os.path.join(MODEL_DIR, f"ppo_sol_perp_{tag}"),
+        os.path.join(MODEL_DIR, f"vec_normalize_{tag}.pkl"),
+        os.path.join(LOG_DIR,   f"training_log_{tag}.csv"),
     )
 
 
@@ -176,6 +181,8 @@ def train_one(window: int, duration: int,
             max_leverage       = MAX_LEVERAGE,
             initial_equity     = 1_000.0,
             max_trade_duration = duration,
+            min_hold_steps     = MIN_HOLD_STEPS,
+            train_end_date     = TRAIN_END_DATE,
         )
 
     env = DummyVecEnv([make_env])
@@ -226,6 +233,9 @@ def train_one(window: int, duration: int,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR,   exist_ok=True)
 
     combinations  = list(itertools.product(WINDOW_SIZES, TRADE_DURATIONS))
     total_models  = len(combinations)
