@@ -50,20 +50,49 @@ Position sizing  (identical logic to SolPerpEnv, applied per asset)
   The drawdown penalty (>30%) naturally discourages simultaneous over-exposure.
 
 ──────────────────────────────────────────────────────────────────────────────
-Reward  (same structure as SolPerpEnv, aggregated across assets)
+Reward  (simplified, per-asset isolated + portfolio-level tiers)
 
-  Step-level
-    base_return          log(equity_t / equity_{t-1})
-    +2×STEP per asset    position regime-aligned with SMA-200 AND SMA-500
-    +0.5×STEP per asset  flat patience (reduces overtrading per asset)
-    +4×STEP              running 50-step portfolio Sharpe > 1.5
-    -8× excess_dd        portfolio drawdown above 30%
-    -6× fee_rate         per-trade entry fee penalty (per asset)
+  Per-asset sub-reward (computed independently for each asset — fixes credit
+  assignment: each asset gets a clean signal about its own behaviour only)
 
-  Trade-close (per asset, fired on SL / TP / timeout)
-    ± TRADE_SCALE × R    price-based R-multiple (direction-adjusted, capped ±[−3, +5])
-    streak_penalty        -2×STEP if 3+ consecutive losses (global)
-    streak_bonus          +2×STEP if 3+ consecutive wins   (global)
+    +STEP_SCALE          flat patience — waiting is explicitly rewarded per asset
+    +TRADE_SCALE × R     trade-close PnL (price-based R-multiple, capped [−3,+5])
+                         positive R → bonus, negative R → penalty
+
+  Portfolio-level reward (shared, fired once per step)
+
+    Rolling fee threshold (168-step window):
+      No per-step funding penalty — fees are a cost of doing business.
+      Penalty fires only when cumulative fees (trading + funding) in the last
+      168 steps exceed 2% of current equity — i.e. the agent is overtrading.
+      Penalty ∝ excess above threshold, scaled to equity.
+
+    Tiered drawdown penalties (continuous, escalating per 5% band):
+      0–15%  DD  →  no penalty
+      15–20% DD  →  small    (× 4)
+      20–25% DD  →  medium   (× 8,  additive)
+      25–30% DD  →  large    (×16,  additive)
+      30%+   DD  →  critical (×32,  additive)
+
+    Resettable gain tier bonuses (portfolio equity vs episode-start equity):
+      Triggers on upward crossing of each 5% tier (5/10/15/20%).
+      Tier unclaims when equity falls back below threshold → fires again
+      on recovery. Moving forward to higher tiers gives proportionally
+      larger bonuses — only way to earn more is to push higher.
+      +5%  tier  →  +5  × STEP_SCALE
+      +10% tier  →  +10 × STEP_SCALE
+      +15% tier  →  +15 × STEP_SCALE
+      +20% tier  →  +20 × STEP_SCALE
+
+  Portfolio leverage cap  (hard mechanical constraint, not reward)
+    Entry refused if sum(|positions|) + new_size > MAX_PORTFOLIO_LEVERAGE (6.0)
+
+  Removed vs previous version:
+    - Per-step funding penalty (replaced by rolling fee threshold)
+    - Entry fee multiplier (12×)
+    - Rolling Sharpe bonus (noisy, hard to learn from)
+    - Per-trade milestone bonuses (1R, 2R)
+    - Streak bonuses / penalties
 
 ──────────────────────────────────────────────────────────────────────────────
 Data alignment
@@ -87,8 +116,10 @@ DIR_SHORT = -1
 DIR_FLAT  =  0
 DIR_LONG  =  1
 
-SHORT_THRESHOLD = -0.5
-LONG_THRESHOLD  =  0.5
+SHORT_THRESHOLD = -0.7   # raised from -0.5: agent needs more conviction to go short
+LONG_THRESHOLD  =  0.7   # raised from +0.5: agent needs more conviction to go long
+# Flat zone is now 70% of the action range (-0.7 to +0.7) vs 50% before.
+# This structurally forces more selectivity without relying purely on reward signals.
 
 FEATURE_COLS = [
     "close", "rsi_14", "atr_14", "volatility_20",
@@ -108,7 +139,8 @@ SMA200_IDX = FEATURE_COLS.index("price_vs_sma200")
 SMA500_IDX = FEATURE_COLS.index("price_vs_sma500")
 
 STEP_SCALE  = 0.001
-TRADE_SCALE = 0.015
+TRADE_SCALE = 0.04              # raised from 0.015 — trade close is the primary signal
+MAX_PORTFOLIO_LEVERAGE = 6.0    # hard cap on sum(|positions|) across all assets
 
 
 class MultiAssetPerpEnv(gym.Env):
@@ -239,10 +271,19 @@ class MultiAssetPerpEnv(gym.Env):
         self.equity_at_entries = [self.equity]   * self.n_assets
         self.just_entered      = [False]         * self.n_assets
 
-        # ── Global streak and return history ──────────────────────────────────
-        self.consec_wins    = 0
-        self.consec_losses  = 0
-        self.return_history = []
+        # ── Portfolio gain tier tracking (resettable triggers) ───────────────
+        # Tiers: [+5%, +10%, +15%, +20%] from episode-start equity.
+        # Claimed → True when bonus fires. Unclaimed → False when equity
+        # drops back below threshold, enabling the trigger to fire again.
+        self.gain_tiers_claimed = [False] * 4
+
+        # ── Rolling fee window (168 steps = 1 week of hourly bars) ───────────
+        # Tracks cumulative fees + funding to detect overtrading.
+        self.fee_window = []
+
+        # ── Global streak counter (kept for observation only) ─────────────────
+        self.consec_wins   = 0
+        self.consec_losses = 0
 
         obs  = self._get_observation()
         info = {"equity": self.equity, "n_assets": self.n_assets}
@@ -349,6 +390,14 @@ class MultiAssetPerpEnv(gym.Env):
                         self.max_leverage,
                     )
 
+                    # ── Portfolio leverage cap ─────────────────────────────────
+                    # Refuse entry if total portfolio exposure would exceed limit.
+                    # Prevents catastrophic 12× simultaneous leverage across 4 assets.
+                    total_current = sum(abs(p) for p in self.positions)
+                    if total_current + position_size > MAX_PORTFOLIO_LEVERAGE:
+                        direction = DIR_FLAT   # skip this entry
+
+                if direction != DIR_FLAT:
                     self.positions[i]         = direction * position_size
                     self.entry_prices[i]      = current_price
                     self.equity_at_entries[i] = self.equity
@@ -366,6 +415,8 @@ class MultiAssetPerpEnv(gym.Env):
                         self.tp_prices[i] = current_price - tp_distance
 
                     trade_fee = abs(self.positions[i]) * self.equity * self.fee_rate
+                    # Reset just_entered flag — no longer used for fee penalty
+                    # (entry cost is captured by the rolling fee threshold instead)
 
             # ── IN_TRADE: check exit conditions (actions ignored) ──────────────
             elif self.trade_states[i] == IN_TRADE:
@@ -404,15 +455,28 @@ class MultiAssetPerpEnv(gym.Env):
             total_fees    += trade_fee
             total_funding += funding_payment
 
-            # ── Per-asset reward components ────────────────────────────────────
+            # ── Per-asset reward components (isolated — no cross-asset contamination)
 
-            # Trade-close: price-based R-multiple (unaffected by other assets' equity moves)
+            # ── Flat patience ──────────────────────────────────────────────────
+            # Each asset independently rewarded for staying out of the market.
+            # Waiting is a valid strategy; this makes it competitive with trading.
+            if self.trade_states[i] == FLAT and not self.just_entered[i]:
+                bonus += STEP_SCALE
+
+            # Clear just_entered flag (entry fee penalty removed — rolling fee
+            # threshold handles overtrading signal at the portfolio level instead)
+            if self.just_entered[i]:
+                self.just_entered[i] = False
+
+            # ── Trade-close: per-asset price-based R-multiple ──────────────────
+            # Isolated from other assets — this asset's price move only.
+            # No streak bonuses/penalties (too noisy, removed for clarity).
             if trade_closed and self.trade_risk_pcts[i] > 0:
                 if sl_hit:
                     exit_price = self.sl_prices[i]
                 elif tp_hit:
                     exit_price = self.tp_prices[i]
-                else:                        # timeout — exits at next open (approx. next_price)
+                else:
                     exit_price = next_price
 
                 if self.trade_directions[i] == DIR_LONG:
@@ -421,8 +485,9 @@ class MultiAssetPerpEnv(gym.Env):
                     raw_return = (self.entry_prices[i] - exit_price) / (self.entry_prices[i] + 1e-8)
 
                 r_multiple = raw_return * abs(self.positions[i]) / (self.trade_risk_pcts[i] / 100.0 + 1e-8)
+                r_clipped  = float(np.clip(r_multiple, -3.0, 5.0))
 
-                # Update global streak
+                # Update streak counter (used for observation, not reward)
                 if raw_return > 0:
                     self.consec_wins   += 1
                     self.consec_losses  = 0
@@ -430,37 +495,10 @@ class MultiAssetPerpEnv(gym.Env):
                     self.consec_wins    = 0
                     self.consec_losses += 1
 
-                r_clipped = float(np.clip(r_multiple, -3.0, 5.0))
                 if r_clipped >= 0:
                     bonus   += TRADE_SCALE * r_clipped
                 else:
                     penalty += TRADE_SCALE * abs(r_clipped)
-
-                if self.consec_losses >= 3:
-                    penalty += 2 * STEP_SCALE
-                if self.consec_wins >= 3:
-                    bonus   += 2 * STEP_SCALE
-
-            # Regime alignment
-            sma200 = float(self.features[i][self.idx, SMA200_IDX])
-            sma500 = float(self.features[i][self.idx, SMA500_IDX])
-            strong_bull    = sma200 > 0 and sma500 > 0
-            strong_bear    = sma200 <= 0 and sma500 <= 0
-            regime_aligned = (
-                (self.positions[i] >  0.05 and strong_bull) or
-                (self.positions[i] < -0.05 and strong_bear)
-            )
-            if regime_aligned:
-                bonus += 2 * STEP_SCALE
-
-            # Flat patience per asset
-            if self.trade_states[i] == FLAT and not self.just_entered[i]:
-                bonus += 0.5 * STEP_SCALE
-
-            # Entry fee penalty (makes cost salient during learning)
-            if self.just_entered[i]:
-                penalty += abs(self.positions[i]) * self.fee_rate * 6.0
-                self.just_entered[i] = False
 
         # ── Update shared equity ──────────────────────────────────────────────
         self.equity += total_pnl - total_fees - total_funding
@@ -475,20 +513,50 @@ class MultiAssetPerpEnv(gym.Env):
         # ── Portfolio-level reward components ─────────────────────────────────
         base_return = np.log(self.equity / (old_equity + 1e-8))
 
-        self.return_history.append(base_return)
-        if len(self.return_history) > 100:
-            self.return_history.pop(0)
+        # ── Rolling fee threshold (168-step window) ────────────────────────────
+        # Fees are a cost of doing business — no per-step penalty.
+        # Penalty fires only when cumulative fees in the last 168 steps (1 week)
+        # exceed 2% of current equity — a sign of destructive overtrading.
+        step_fees = total_fees + abs(total_funding)
+        self.fee_window.append(step_fees)
+        if len(self.fee_window) > 168:
+            self.fee_window.pop(0)
+        rolling_fees  = sum(self.fee_window)
+        fee_threshold = 0.02 * (self.equity + 1e-8)
+        if rolling_fees > fee_threshold:
+            excess_fees = rolling_fees - fee_threshold
+            penalty += (excess_fees / (self.equity + 1e-8)) * 10.0
 
-        # Running Sharpe consistency bonus
-        if len(self.return_history) >= 50:
-            arr    = np.array(self.return_history)
-            sharpe = arr.mean() / (arr.std() + 1e-8) * np.sqrt(8760)
-            if sharpe > 1.5:
-                bonus += 4 * STEP_SCALE
+        # ── Tiered drawdown penalties (escalating per 5% band) ────────────────
+        # No penalty below 15%. Each band above adds an increasing layer,
+        # creating a smooth but steepening cost curve as drawdown worsens.
+        # Asymmetric with gain bonuses — losses hurt more than gains help.
+        if current_drawdown > 0.15:
+            penalty += (current_drawdown - 0.15) * 4.0
+        if current_drawdown > 0.20:
+            penalty += (current_drawdown - 0.20) * 8.0
+        if current_drawdown > 0.25:
+            penalty += (current_drawdown - 0.25) * 16.0
+        if current_drawdown > 0.30:
+            penalty += (current_drawdown - 0.30) * 32.0
 
-        # Drawdown penalty
-        excess_dd = max(0.0, current_drawdown - 0.30)
-        penalty  += 8.0 * excess_dd
+        # ── Resettable gain tier bonuses ───────────────────────────────────────
+        # Fires on upward crossing of each 5% equity gain from episode start.
+        # Tier unclaims when equity falls back below threshold — the agent can
+        # earn the bonus again by recovering, but must push to higher tiers to
+        # earn progressively larger rewards. Asymmetric: smaller than DD penalties.
+        gain_thresholds = [1.05, 1.10, 1.15, 1.20]
+        gain_bonuses    = [5,    10,   15,   20  ]   # × STEP_SCALE
+        equity_ratio    = self.equity / (self.initial_equity + 1e-8)
+
+        for t, (threshold, bonus_mult) in enumerate(zip(gain_thresholds, gain_bonuses)):
+            if equity_ratio >= threshold:
+                if not self.gain_tiers_claimed[t]:
+                    bonus += bonus_mult * STEP_SCALE
+                    self.gain_tiers_claimed[t] = True
+            else:
+                # Unclaim — tier becomes available to trigger again on recovery
+                self.gain_tiers_claimed[t] = False
 
         reward = base_return + bonus - penalty
         done   = self.idx >= self._episode_end

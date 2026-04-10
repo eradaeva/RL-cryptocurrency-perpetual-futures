@@ -1,28 +1,33 @@
 """
-train_multi_ppo.py  —  Multi-asset PPO grid trainer
-=====================================================
-Trains all combinations of window size × trade duration on the 4-asset
-portfolio environment (BTC, ETH, SOL, BNB).
+train_multi_ppo.py  —  Multi-asset PPO retraining (5 configs)
+==============================================================
+Retrains 5 configs with the fully redesigned reward function:
 
-Grid:
-    WINDOW_SIZES    = [24, 48, 96, 168]   hours of market lookback
-    TRADE_DURATIONS = [24, 48, 72, 168]   max hours per committed trade
-    Total           = 16 models
+  Reward changes (vs previous version):
+  - Per-asset isolated sub-rewards (fixes credit assignment)
+  - Flat patience: +STEP_SCALE per asset (simplified, no regime alignment)
+  - Trade close: +TRADE_SCALE × R-multiple per asset (primary signal)
+  - Rolling fee threshold: penalty only when 168-step cumulative fees > 2% equity
+  - Tiered drawdown penalties: 15/20/25/30% bands, coefficients 4/8/16/32 (additive)
+  - Resettable gain tier bonuses: +5/10/15/20% from episode start, 5/10/15/20×STEP
+  - Removed: per-step funding penalty, entry fee multiplier, Sharpe bonus,
+             milestone bonuses, streak bonuses
 
-Each model is saved as:
-    ppo_multi_perp/ppo_multi_perp_w{W}_td{D}.zip
+  Configs trained:
+    w=168h / td=168h   mirrors single-asset winner
+    w=96h  / td=48h    best drawdown in original grid
+    w=48h  / td=48h    new — short-medium balanced
+    w=96h  / td=96h    new — medium balanced
+    w=24h  / td=168h   best Sharpe in original grid
+
+Each model saved as:
+    ppo_multi_perp/ppo_multi_perp_w{W}_td{D}.zip     (overwrites old)
     ppo_multi_perp/vec_normalize_w{W}_td{D}.pkl
     training_log_multi/training_log_w{W}_td{D}.csv
 
-To train a single model instead of the full grid:
-    Set  WINDOW_SIZES = [168]  and  TRADE_DURATIONS = [168]
+SKIP_EXISTING = False  — always retrain (new reward requires fresh weights)
 
-Estimated time (CPU):
-    ~30–50 min per model × 16 = 8–13 hours  (run overnight)
-    Slightly longer than single-asset due to larger observation space.
-
-SKIP_EXISTING = True  means already-saved models are skipped automatically,
-so you can safely re-run after a crash and it will continue from where it left off.
+Estimated time (CPU):  ~1.5h per model × 5 = 7–8h  (run overnight)
 """
 
 import os
@@ -48,11 +53,12 @@ ASSET_NAMES = ["BTC", "ETH", "SOL", "BNB"]
 
 # ── Grid ──────────────────────────────────────────────────────────────────────
 
-WINDOW_SIZES    = [24, 48, 96, 168]
-TRADE_DURATIONS = [24, 48, 72, 168]
+# Top 3 configs selected for retraining with redesigned reward
+WINDOW_SIZES    = [168, 96, 48, 96, 24]
+TRADE_DURATIONS = [168, 48, 48, 96, 168]   # paired: (168,168), (96,48), (48,48), (96,96), (24,168)
 
 TOTAL_STEPS    = 3_000_000   # per model
-SKIP_EXISTING  = True        # skip already-trained models (safe to re-run)
+SKIP_EXISTING  = False       # always retrain — new reward requires fresh weights
 
 TRAIN_END_DATE = "2023-12-31"   # training data boundary (2024+ for val/test)
 FEE_RATE       = 0.0005
@@ -240,7 +246,7 @@ if __name__ == "__main__":
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(LOG_DIR,   exist_ok=True)
 
-    combinations    = list(itertools.product(WINDOW_SIZES, TRADE_DURATIONS))
+    combinations    = list(zip(WINDOW_SIZES, TRADE_DURATIONS))
     total_models    = len(combinations)
     total_steps_all = total_models * TOTAL_STEPS
 

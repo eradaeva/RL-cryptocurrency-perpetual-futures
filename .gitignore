@@ -32,7 +32,7 @@ perpetual_futures_data/
 *.pt
 *.pth
 *.h5
-*.onnx
+*.onnxr
 
 # Output charts / images
 eval_chart_*.png

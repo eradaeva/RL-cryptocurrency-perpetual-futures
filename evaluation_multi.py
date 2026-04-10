@@ -47,6 +47,16 @@ MAX_LEV     = 3.0
 MIN_HOLD    = 12
 INIT_EQUITY = 1_000.0
 
+# Set to a list of (window, duration) tuples to evaluate specific models only.
+# Set to None to evaluate every model found in MODEL_DIR (full 16-model grid).
+EVAL_CONFIGS = [
+    (168, 168),   # mirrors single-asset winner
+    ( 96,  48),   # best drawdown in original grid
+    ( 48,  48),   # new — short-medium balanced
+    ( 96,  96),   # new — medium balanced
+    ( 24, 168),   # best Sharpe in original grid
+]
+
 PERIODS = [
     ("[IS] Early Bull  (Sep 2020–Jun 2021)",  "2020-09-01", "2021-06-01"),
     ("[IS] Peak & Crash(Jun 2021–Jun 2022)",  "2021-06-01", "2022-06-01"),
@@ -139,12 +149,16 @@ def compute_btc_bnh(eval_start, eval_end):
 # ── Model discovery ────────────────────────────────────────────────────────────
 
 def discover_models():
+    """Return sorted list of (window, duration) tuples to evaluate.
+    Respects EVAL_CONFIGS filter if set; otherwise returns all found models."""
     pattern = re.compile(r"ppo_multi_perp_w(\d+)_td(\d+)\.zip$")
     found   = []
     for p in sorted(MODEL_DIR.glob("ppo_multi_perp_w*_td*.zip")):
         m = pattern.match(p.name)
         if m:
             found.append((int(m.group(1)), int(m.group(2))))
+    if EVAL_CONFIGS is not None:
+        found = [cfg for cfg in found if cfg in EVAL_CONFIGS]
     return sorted(found)
 
 

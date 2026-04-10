@@ -63,19 +63,28 @@ Reward
 
   Step-level
     base_return          log(equity_t / equity_{t-1})   ← fees already in equity
-    +2×STEP_SCALE        position aligned with SMA-200 AND SMA-500 (strong regime)
-    +4×STEP_SCALE        running 50-step Sharpe > 1.5  (consistency)
-    +0.5×STEP_SCALE      flat patience: tiny bonus for staying out (reduces overtrading)
-    -8× excess_dd        drawdown above 30% threshold
+    +2×STEP_SCALE        flat patience: meaningful bonus for staying out (discourages
+                         overtrading — now equals old regime alignment to make waiting
+                         a genuinely competitive option)
+    +STEP×max(0,sh)×0.3  continuous Sharpe bonus (proportional, no binary cliff):
+                         Sharpe=1.0 → +0.0003/step, Sharpe=2.0 → +0.0006/step
+    -10× excess_dd       drawdown above 25% threshold (tightened from 30%)
     -fee_penalty         6× fee rate on entry (makes trading cost salient)
+    -1.5×|funding|/eq    funding penalty: makes holding leveraged positions through
+                         funding intervals explicitly painful
 
   Trade-close  (fired once when SL / TP / timeout)
-    ±TRADE_SCALE × R     R-multiple of trade:  win=+, loss=−
+    ±TRADE_SCALE × R     R-multiple of trade:  win=+, loss=−  (TRADE_SCALE=0.04)
                          R = (equity_exit − equity_entry) /
                              equity_entry / (risk_pct/100)
     Capped: R ∈ [−3, +5]
     streak_penalty       -2×STEP if 3+ consecutive losses
     streak_bonus         +2×STEP if 3+ consecutive wins
+
+  Partial achievement milestones  (fired once per trade, not repeatable)
+    +STEP_SCALE          unrealized R crosses +1.0  (trade at 1× risk in profit)
+    +STEP_SCALE          unrealized R crosses +2.0  (trade at 2× risk in profit)
+    Gives the agent directional feedback mid-trade without chasing a continuous drip.
 
   Structural constraints
     TP ≥ 2× SL distance  (2:1 R:R floor — even 40% WR is profitable)
@@ -242,6 +251,10 @@ class SolPerpEnv(gym.Env):
         self.equity_at_entry  = self.equity
         self.just_entered     = False   # fee-penalty flag: True on entry candle
 
+        # ── Partial achievement milestones (reset each new trade) ─────────────
+        self.milestone_1r = False   # True once unrealized R crosses +1.0
+        self.milestone_2r = False   # True once unrealized R crosses +2.0
+
         # ── Streak tracking (trade-level, not step-level) ─────────────────────
         self.consec_wins   = 0
         self.consec_losses = 0
@@ -353,6 +366,8 @@ class SolPerpEnv(gym.Env):
                 self.trade_entry_step = self.idx
                 self.trade_state      = IN_TRADE
                 self.just_entered     = True   # fires fee penalty this step
+                self.milestone_1r     = False  # reset milestones for new trade
+                self.milestone_2r     = False
 
                 if direction == DIR_LONG:
                     self.sl_price = current_price - sl_distance
@@ -437,45 +452,51 @@ class SolPerpEnv(gym.Env):
             self.return_history.pop(0)
 
         STEP_SCALE  = 0.001
-        TRADE_SCALE = 0.015
+        TRADE_SCALE = 0.04          # raised from 0.015 — trade close is the primary signal
         bonus   = 0.0
         penalty = 0.0
 
-        # Regime alignment: reward only when both SMA-200 AND SMA-500 agree
-        price_vs_sma200 = float(self.features[self.idx, self._sma200_idx])
-        price_vs_sma500 = float(self.features[self.idx, self._sma500_idx])
-        above_sma200    = price_vs_sma200 > 0
-        above_sma500    = price_vs_sma500 > 0
-        strong_bull     = above_sma200 and above_sma500
-        strong_bear     = (not above_sma200) and (not above_sma500)
-        regime_aligned  = (
-            (self.position >  0.05 and strong_bull) or
-            (self.position < -0.05 and strong_bear)
-        )
-        if regime_aligned:
+        # ── Flat patience ──────────────────────────────────────────────────────
+        # Meaningful bonus (2×STEP) makes waiting a competitive option vs trading.
+        # Regime alignment removed — agent learns it implicitly by making money.
+        if self.trade_state == FLAT and not self.just_entered:
             bonus += 2 * STEP_SCALE
 
-        # Flat patience: tiny positive for staying out (discourages overtrading)
-        if self.trade_state == FLAT and not self.just_entered:
-            bonus += 0.5 * STEP_SCALE
-
-        # Per-trade fee penalty: makes entry cost salient to the policy
+        # ── Per-trade fee penalty ──────────────────────────────────────────────
         if self.just_entered:
             penalty += abs(self.position) * self.fee_rate * 6.0
             self.just_entered = False
 
-        # Running Sharpe consistency bonus (last 50 steps)
+        # ── Continuous Sharpe bonus (proportional, no binary cliff) ───────────
         if len(self.return_history) >= 50:
             arr    = np.array(self.return_history)
             sharpe = arr.mean() / (arr.std() + 1e-8) * np.sqrt(8760)
-            if sharpe > 1.5:
-                bonus += 4 * STEP_SCALE
+            bonus += STEP_SCALE * max(0.0, sharpe) * 0.3
 
-        # Drawdown penalty
-        excess_dd = max(0.0, current_drawdown - 0.30)
-        penalty  += 8.0 * excess_dd
+        # ── Funding penalty ────────────────────────────────────────────────────
+        # Makes holding leveraged positions through funding intervals explicitly
+        # costly — important signal the agent can't see in equity alone.
+        penalty += 1.5 * abs(funding_payment) / (self.equity + 1e-8)
 
-        # Trade-close: R-multiple calibration signal
+        # ── Drawdown penalty (tightened threshold) ─────────────────────────────
+        excess_dd = max(0.0, current_drawdown - 0.25)   # was 0.30
+        penalty  += 10.0 * excess_dd                     # was 8.0
+
+        # ── Partial achievement milestones ─────────────────────────────────────
+        # One-time bonuses when the current trade reaches +1R and +2R unrealized.
+        # Gives directional feedback mid-trade without a continuous drip.
+        if self.trade_state == IN_TRADE and self.trade_risk_pct > 0:
+            unrealized_pct = (self.equity - self.equity_at_entry) \
+                              / (self.equity_at_entry + 1e-8)
+            unrealized_r   = unrealized_pct / (self.trade_risk_pct / 100.0 + 1e-8)
+            if unrealized_r >= 1.0 and not self.milestone_1r:
+                bonus += STEP_SCALE
+                self.milestone_1r = True
+            if unrealized_r >= 2.0 and not self.milestone_2r:
+                bonus += STEP_SCALE
+                self.milestone_2r = True
+
+        # ── Trade-close: R-multiple calibration signal ─────────────────────────
         if trade_closed:
             r_clipped = float(np.clip(r_multiple, -3.0, 5.0))
             if r_clipped >= 0:
@@ -485,9 +506,9 @@ class SolPerpEnv(gym.Env):
 
             # Streak signals
             if self.consec_losses >= 3:
-                penalty += 2 * STEP_SCALE   # calibration is off
+                penalty += 2 * STEP_SCALE
             if self.consec_wins   >= 3:
-                bonus   += 2 * STEP_SCALE   # agent is reading market well
+                bonus   += 2 * STEP_SCALE
 
         reward = base_return + bonus - penalty
         done   = self.idx >= self._episode_end
@@ -506,7 +527,8 @@ class SolPerpEnv(gym.Env):
             "timeout_hit":      timeout_hit,
             "trade_closed":     trade_closed,
             "r_multiple":       r_multiple,
-            "regime_aligned":   regime_aligned,
+            "milestone_1r":     self.milestone_1r,
+            "milestone_2r":     self.milestone_2r,
             "trade_state":      "IN_TRADE" if self.trade_state == IN_TRADE else "FLAT",
             "trade_risk_pct":   self.trade_risk_pct if self.trade_state == IN_TRADE else 0.0,
         }
