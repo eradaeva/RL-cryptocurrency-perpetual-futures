@@ -366,7 +366,9 @@ if __name__ == "__main__":
 
     # Comment out assets you don't need
     ASSETS = [
-        "SOLUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        "BNBUSDT",
     ]
     # ─────────────────────────────────────────────────────────────────────────
 
