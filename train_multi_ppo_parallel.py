@@ -1,27 +1,33 @@
 """
-train_multi_ppo_gpu.py  —  Multi-asset PPO (CPU-parallel, SubprocVecEnv)
-=========================================================================
-Faster version of train_multi_ppo.py using parallel environment collection
-instead of GPU (which is slower for small MlpPolicy networks — see SB3 #1245).
+train_multi_ppo_parallel.py  --  Multi-asset PPO (CPU-parallel, SubprocVecEnv)
+===============================================================================
+Swing-trader configuration -- v3.2 reward, w336/td336 winner.
 
-Speedup mechanism — SubprocVecEnv:
-  N_ENVS independent environment copies run in separate subprocesses and step
-  simultaneously.  Each subprocess uses one CPU core.  The agent collects
-  N_ENVS transitions per step instead of 1, giving proportional rollout speedup.
+Smoke test verdict (Apr 2026):
+  All short-window configs (w24, w96, w168 with td48/td168) showed fee drag
+  3000%+ or near-wipeout at 500k steps. w336/td336 was the only config to
+  produce a positive OOS return (+9.4%, $1,093 from $1,000) at 500k steps.
 
-  Original : 1 env  × n_steps=2048 → 2048 transitions per rollout
-  This file: 4 envs × n_steps=512  → 2048 transitions per rollout (same size)
-                                      but ~3–4× faster collection
+  Why w336/td336 wins:
+    - 2-week context window gives the agent enough bars to interpret
+      price_vs_sma500 and the v3.2 trend alignment reward meaningfully.
+    - 2-week max hold (td=336) prevents forced premature exits and the
+      re-entry churn cycle that caused 3000%+ fee drag in short-td configs.
+    - min_hold=72 gives trades room to breathe before SL/TP can fire.
+    - [512,256] network compresses the 26,910-dim observation space.
 
-  Gradient update phase is unchanged (same total batch, same batch_size).
+  5M steps chosen over 3M because:
+    - 10x larger obs space + 25x more network parameters vs previous configs.
+    - Trend alignment reward needs many completed trades to shape the policy.
+    - With min_hold=72 and td=336, fewer trades per episode -> need more episodes.
 
-Expected wall-clock improvement vs original script:
-  M1 Max (10 perf cores, N_ENVS=4) : ~2.5–3.5×
-  Any modern quad-core CPU          : ~2–3×
+Parallelism -- SubprocVecEnv:
+  4 envs x 512 steps = 2048 transitions per rollout.
+  ~3-4x faster collection than single-env training.
 
 Memory note:
-  Each subprocess loads all 4 CSVs independently — expect ~4× RAM vs original.
-  On M1 Max 64 GB this is not a concern.  Reduce N_ENVS if RAM is tight.
+  Each subprocess loads all 4 CSVs independently.
+  On M1 Max 64 GB this is not a concern.
 """
 
 import os
@@ -34,16 +40,13 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from multi_asset_env import MultiAssetPerpEnv
 
 
-# ── Parallelism ───────────────────────────────────────────────────────────────
+# -- Parallelism ---------------------------------------------------------------
 
-N_ENVS = 8   # parallel environment workers
-             # safe on M1 Max (10 perf cores); lower to 2 if RAM is a concern
-
-# n_steps per env: keep total rollout size = N_ENVS × N_STEPS = 2048
-N_STEPS = 2048 // N_ENVS   # = 512
+N_ENVS  = 4              # parallel environment workers (safe on M1 Max)
+N_STEPS = 2048 // N_ENVS  # 512 per env x 4 = 2048 total rollout
 
 
-# ── Assets ────────────────────────────────────────────────────────────────────
+# -- Assets --------------------------------------------------------------------
 
 CSV_PATHS = [
     "BTCUSDT_perpetual_futures_processed_2020-2026.csv",
@@ -53,50 +56,48 @@ CSV_PATHS = [
 ]
 ASSET_NAMES = ["BTC", "ETH", "SOL", "BNB"]
 
-# ── Grid ──────────────────────────────────────────────────────────────────────
 
-WINDOW_SIZES    = [168, 96, 48, 96, 24]
-TRADE_DURATIONS = [168, 48, 48, 96, 168]   # paired: (168,168), (96,48), (48,48), (96,96), (24,168)
+# -- Winning config (smoke test Apr 2026) --------------------------------------
 
-TOTAL_STEPS    = 3_000_000
-SKIP_EXISTING  = False
+WINDOW_SIZE    = 336        # 2-week context window
+TRADE_DURATION = 336        # 2-week max hold
+MIN_HOLD_STEPS = 72         # 3-day minimum hold before SL/TP can fire
+NET_ARCH       = [512, 256] # network sized for 26,910-dim obs space
 
+TOTAL_STEPS    = 5_000_000  # 5M -- needed for [512,256] net on 26k-dim obs
 TRAIN_END_DATE = "2023-12-31"
 FEE_RATE       = 0.0005
 MAX_LEVERAGE   = 3.0
-MIN_HOLD_STEPS = 12
 
 MODEL_DIR = "ppo_multi_perp"
 LOG_DIR   = "training_log_multi"
 
-PRINT_EVERY = 100_000
+PRINT_EVERY = 250_000       # progress print every 250k steps (20 prints total)
 
 
-# ── Progress callback ─────────────────────────────────────────────────────────
+# -- Progress callback ---------------------------------------------------------
 
-class GridProgressCallback(BaseCallback):
-    """Prints a live progress bar and key metrics every PRINT_EVERY steps."""
+class TrainingCallback(BaseCallback):
+    """Prints progress and key metrics every PRINT_EVERY steps."""
 
-    def __init__(self, total_steps, model_idx, total_models,
-                 model_name, log_path, print_every=100_000):
+    def __init__(self, total_steps, model_name, log_path, print_every=250_000):
         super().__init__(verbose=0)
-        self.total_steps  = total_steps
-        self.model_idx    = model_idx
-        self.total_models = total_models
-        self.model_name   = model_name
-        self.log_path     = log_path
-        self.print_every  = print_every
-        self._last_print  = 0
-        self.rows         = []
-        self._t0          = None
+        self.total_steps = total_steps
+        self.model_name  = model_name
+        self.log_path    = log_path
+        self.print_every = print_every
+        self._last_print = 0
+        self.rows        = []
+        self._t0         = None
 
-    def _on_training_start(self) -> None:
+    def _on_training_start(self):
         self._t0 = time.time()
-        print(f"\n  ▶  Starting  {self.model_name}"
-              f"  [{self.model_idx}/{self.total_models}]"
-              f"  workers={N_ENVS}  n_steps/env={N_STEPS}")
+        print(f"\n  Starting  {self.model_name}")
+        print(f"  Config    : w{WINDOW_SIZE}/td{TRADE_DURATION}/mh{MIN_HOLD_STEPS}"
+              f"  net={NET_ARCH}  steps={TOTAL_STEPS:,}")
+        print(f"  Workers   : {N_ENVS}  x  {N_STEPS} steps/env  =  {N_ENVS*N_STEPS} total/rollout")
 
-    def _on_rollout_start(self) -> None:
+    def _on_rollout_start(self):
         nv = self.model.logger.name_to_value
         self.rows.append({
             "timestep":      self.num_timesteps,
@@ -110,50 +111,43 @@ class GridProgressCallback(BaseCallback):
             "ep_len_mean":   nv.get("rollout/ep_len_mean"),
         })
 
-    def _on_step(self) -> bool:
+    def _on_step(self):
         if self.num_timesteps - self._last_print < self.print_every:
             return True
         self._last_print = self.num_timesteps
 
-        elapsed   = time.time() - self._t0
-        model_pct = self.num_timesteps / self.total_steps * 100
-
-        steps_done_total = (self.model_idx - 1) * self.total_steps + self.num_timesteps
-        overall_pct      = steps_done_total / (self.total_models * self.total_steps) * 100
-
-        rate      = self.num_timesteps / (elapsed + 1e-6)
-        eta_this  = (self.total_steps - self.num_timesteps) / (rate + 1e-6)
-        remaining = self.total_models - self.model_idx
-        eta_total = eta_this + remaining * self.total_steps / (rate + 1e-6)
+        elapsed  = time.time() - self._t0
+        pct      = self.num_timesteps / self.total_steps * 100
+        rate     = self.num_timesteps / (elapsed + 1e-6)
+        eta      = (self.total_steps - self.num_timesteps) / (rate + 1e-6)
 
         nv  = self.model.logger.name_to_value
         ev  = nv.get("train/explained_variance", float("nan"))
         rew = nv.get("rollout/ep_rew_mean",       float("nan"))
+        kl  = nv.get("train/approx_kl",           float("nan"))
 
-        bar_filled = int(30 * model_pct / 100)
-        bar        = "█" * bar_filled + "░" * (30 - bar_filled)
+        bar_filled = int(30 * pct / 100)
+        bar        = "=" * bar_filled + "." * (30 - bar_filled)
 
         print(
-            f"  [{bar}] {model_pct:5.1f}%  "
-            f"model {self.model_idx}/{self.total_models}  "
-            f"overall {overall_pct:5.1f}%  "
-            f"EV={ev:+.3f}  rew={rew:.4f}  "
-            f"ETA this={_fmt_time(eta_this)}  "
-            f"total={_fmt_time(eta_total)}"
+            f"  [{bar}] {pct:5.1f}%  "
+            f"steps={self.num_timesteps:,}  "
+            f"EV={ev:+.3f}  rew={rew:.4f}  kl={kl:.4f}  "
+            f"ETA={_fmt_time(eta)}"
         )
         return True
 
-    def _on_training_end(self) -> None:
+    def _on_training_end(self):
         elapsed = time.time() - self._t0
         nv = self.model.logger.name_to_value
         ev = nv.get("train/explained_variance", float("nan"))
-        print(f"  ✓  Done  {self.model_name}  "
-              f"EV={ev:+.3f}  time={_fmt_time(elapsed)}")
+        print(f"\n  Done  {self.model_name}  EV={ev:+.3f}  time={_fmt_time(elapsed)}")
         if self.rows:
             pd.DataFrame(self.rows).to_csv(self.log_path, index=False)
+            print(f"  Training log -> {self.log_path}")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 
 def _fmt_time(seconds: float) -> str:
     s = int(seconds)
@@ -162,149 +156,85 @@ def _fmt_time(seconds: float) -> str:
     return f"{s//60}m {s%60}s"
 
 
-def model_paths(window: int, duration: int):
-    tag = f"w{window}_td{duration}"
-    return (
-        os.path.join(MODEL_DIR, f"ppo_multi_perp_{tag}"),
-        os.path.join(MODEL_DIR, f"vec_normalize_{tag}.pkl"),
-        os.path.join(LOG_DIR,   f"training_log_{tag}.csv"),
-    )
-
-
-def _make_env_fn(window: int, duration: int):
-    """Return a zero-argument callable for SubprocVecEnv (avoids closure issues)."""
+def _make_env_fn():
+    """Zero-argument callable for SubprocVecEnv (avoids closure capture issues)."""
     def _inner():
         return MultiAssetPerpEnv(
             csv_paths          = CSV_PATHS,
             asset_names        = ASSET_NAMES,
-            window_size        = window,
+            window_size        = WINDOW_SIZE,
             fee_rate           = FEE_RATE,
             max_leverage       = MAX_LEVERAGE,
             initial_equity     = 1_000.0,
-            max_trade_duration = duration,
+            max_trade_duration = TRADE_DURATION,
             min_hold_steps     = MIN_HOLD_STEPS,
             train_end_date     = TRAIN_END_DATE,
         )
     return _inner
 
 
-def train_one(window: int, duration: int,
-              model_idx: int, total_models: int) -> dict:
-    """Train a single (window, duration) combination. Returns summary dict."""
-
-    model_path, vecnorm_path, log_path = model_paths(window, duration)
-
-    if SKIP_EXISTING and os.path.exists(f"{model_path}.zip"):
-        print(f"  ⏭  Skipping {model_path}  (already exists)")
-        return {"window": window, "duration": duration,
-                "status": "skipped", "final_ev": None}
-
-    env = SubprocVecEnv([_make_env_fn(window, duration)] * N_ENVS)
-    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
-
-    model = PPO(
-        "MlpPolicy",
-        env,
-        device        = "cpu",
-        verbose       = 0,
-        learning_rate = 3e-4,
-        n_steps       = N_STEPS,   # 512 per env × 4 envs = 2048 total rollout
-        batch_size    = 256,
-        gamma         = 0.99,
-        gae_lambda    = 0.95,
-        clip_range    = 0.2,
-        ent_coef      = 0.01,
-    )
-
-    cb = GridProgressCallback(
-        total_steps  = TOTAL_STEPS,
-        model_idx    = model_idx,
-        total_models = total_models,
-        model_name   = model_path,
-        log_path     = log_path,
-        print_every  = PRINT_EVERY,
-    )
-
-    model.learn(total_timesteps=TOTAL_STEPS, callback=cb)
-
-    model.save(model_path)
-    env.save(vecnorm_path)
-
-    final_ev = None
-    if os.path.exists(log_path):
-        df_log = pd.read_csv(log_path)
-        if "explained_var" in df_log.columns and len(df_log) > 0:
-            final_ev = df_log["explained_var"].iloc[-1]
-
-    del model, env
-    gc.collect()
-
-    return {"window": window, "duration": duration,
-            "status": "trained", "final_ev": final_ev}
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 if __name__ == "__main__":
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(LOG_DIR,   exist_ok=True)
 
-    combinations    = list(zip(WINDOW_SIZES, TRADE_DURATIONS))
-    total_models    = len(combinations)
-    total_steps_all = total_models * TOTAL_STEPS
+    tag         = f"w{WINDOW_SIZE}_td{TRADE_DURATION}_mh{MIN_HOLD_STEPS}"
+    model_path  = os.path.join(MODEL_DIR, f"ppo_multi_perp_{tag}")
+    vecnorm_path = os.path.join(MODEL_DIR, f"vec_normalize_{tag}.pkl")
+    log_path    = os.path.join(LOG_DIR,   f"training_log_{tag}.csv")
 
     print("=" * 70)
-    print(f"  PPO Multi-Asset Grid Training (parallel) — {total_models} models")
-    print(f"  Workers (SubprocVecEnv) : {N_ENVS}")
-    print(f"  n_steps per env         : {N_STEPS}  ({N_ENVS}×{N_STEPS}={N_ENVS*N_STEPS} total/rollout)")
-    print(f"  Assets          : {ASSET_NAMES}")
-    print(f"  Window sizes    : {WINDOW_SIZES}")
-    print(f"  Trade durations : {TRADE_DURATIONS}")
-    print(f"  Steps per model : {TOTAL_STEPS:,}")
-    print(f"  Total steps     : {total_steps_all:,}")
-    print(f"  Skip existing   : {SKIP_EXISTING}")
+    print("  PPO Multi-Asset -- Swing Trader -- 5M steps")
+    print("=" * 70)
+    print(f"  Config       : w{WINDOW_SIZE} / td{TRADE_DURATION} / min_hold={MIN_HOLD_STEPS}")
+    print(f"  Network      : {NET_ARCH}  (obs ~26,910 dims)")
+    print(f"  Total steps  : {TOTAL_STEPS:,}")
+    print(f"  Workers      : {N_ENVS}  x  {N_STEPS} n_steps/env  =  {N_ENVS*N_STEPS}/rollout")
+    print(f"  Assets       : {ASSET_NAMES}")
+    print(f"  Train period : up to {TRAIN_END_DATE}")
+    print(f"  Reward       : v3.2 (trend alignment via price_vs_sma500)")
+    print(f"  Model out    : {model_path}.zip")
     print("=" * 70)
 
-    grid_start = time.time()
-    results    = []
+    env   = SubprocVecEnv([_make_env_fn()] * N_ENVS)
+    norm  = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
-    for idx, (window, duration) in enumerate(combinations, start=1):
-        result = train_one(window, duration, idx, total_models)
-        results.append(result)
+    model = PPO(
+        "MlpPolicy",
+        norm,
+        policy_kwargs = {"net_arch": NET_ARCH},
+        device        = "cpu",
+        verbose       = 0,
+        learning_rate = 3e-4,
+        n_steps       = N_STEPS,
+        batch_size    = 256,
+        n_epochs      = 10,
+        gamma         = 0.99,
+        gae_lambda    = 0.95,
+        clip_range    = 0.2,
+        ent_coef      = 0.01,
+    )
 
-        pct     = idx / total_models * 100
-        elapsed = time.time() - grid_start
-        eta     = elapsed / idx * (total_models - idx) if idx < total_models else 0
-        print(f"\n  Grid progress: {idx}/{total_models} models  "
-              f"({pct:.0f}%)  ETA remaining: {_fmt_time(eta)}\n")
+    cb = TrainingCallback(
+        total_steps = TOTAL_STEPS,
+        model_name  = tag,
+        log_path    = log_path,
+        print_every = PRINT_EVERY,
+    )
 
-    # ── Summary grid ──────────────────────────────────────────────────────────
-    total_time = time.time() - grid_start
-    print("\n" + "=" * 70)
-    print(f"  TRAINING COMPLETE — {_fmt_time(total_time)}  ({N_ENVS} workers)")
-    print("=" * 70)
-    print(f"\n  Final Explained Variance Grid  (higher = better learning)\n")
+    t0 = time.time()
+    model.learn(total_timesteps=TOTAL_STEPS, callback=cb)
 
-    header = f"  {'Window':>8}  " + "  ".join(f"  td={d:>3}h" for d in TRADE_DURATIONS)
-    print(header)
-    print("  " + "─" * (len(header) - 2))
+    model.save(model_path)
+    norm.save(vecnorm_path)
 
-    for window in WINDOW_SIZES:
-        row = f"  w={window:>4}h    "
-        for duration in TRADE_DURATIONS:
-            match = next((r for r in results
-                          if r["window"] == window and r["duration"] == duration), None)
-            if match and match["final_ev"] is not None:
-                ev     = match["final_ev"]
-                marker = " ★" if ev >= 0.5 else "  "
-                row   += f"  {ev:+.3f}{marker}"
-            elif match and match["status"] == "skipped":
-                row += f"  (skip) "
-            else:
-                row += f"    n/a  "
-        print(row)
+    total_time = time.time() - t0
+    print(f"\n  Model saved  -> {model_path}.zip")
+    print(f"  VecNormalize -> {vecnorm_path}")
+    print(f"  Total time   : {_fmt_time(total_time)}")
+    print(f"\n  Next: run evaluation_multi.py to evaluate OOS performance.")
 
-    print("\n  ★ = explained variance ≥ 0.5 (good learning)")
-    print("\n  Models saved as  ppo_multi_perp/ppo_multi_perp_w{W}_td{D}.zip")
-    print("  Run  evaluation_multi.py  to evaluate all models.\n")
+    del model, norm, env
+    gc.collect()

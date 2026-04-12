@@ -66,7 +66,7 @@ TOTAL_STEPS    = 3_000_000
 TRAIN_END_DATE = "2023-12-31"
 FEE_RATE       = 0.0005
 MAX_LEVERAGE   = 3.0
-MIN_HOLD_STEPS = 12
+MIN_HOLD_STEPS = 24   # raised from 12 — forces commitment, halves max trade frequency
 
 MODEL_DIR = "ppo_multi_perp"
 LOG_DIR   = "training_log_multi"
