@@ -44,17 +44,13 @@ MODEL_DIR   = Path("ppo_multi_perp")
 SEED        = 42
 FEE_RATE    = 0.0005
 MAX_LEV     = 3.0
-MIN_HOLD    = 12
+MIN_HOLD    = 72
 INIT_EQUITY = 1_000.0
 
 # Set to a list of (window, duration) tuples to evaluate specific models only.
 # Set to None to evaluate every model found in MODEL_DIR (full 16-model grid).
 EVAL_CONFIGS = [
-    (168, 168),   # mirrors single-asset winner
-    ( 96,  48),   # best drawdown in original grid
-    ( 48,  48),   # new — short-medium balanced
-    ( 96,  96),   # new — medium balanced
-    ( 24, 168),   # best Sharpe in original grid
+    (336, 336),   # swing-trader winner (smoke test Apr 2026)
 ]
 
 PERIODS = [
@@ -151,7 +147,7 @@ def compute_btc_bnh(eval_start, eval_end):
 def discover_models():
     """Return sorted list of (window, duration) tuples to evaluate.
     Respects EVAL_CONFIGS filter if set; otherwise returns all found models."""
-    pattern = re.compile(r"ppo_multi_perp_w(\d+)_td(\d+)\.zip$")
+    pattern = re.compile(r"ppo_multi_perp_w(\d+)_td(\d+)(?:_mh\d+)?\.zip$")
     found   = []
     for p in sorted(MODEL_DIR.glob("ppo_multi_perp_w*_td*.zip")):
         m = pattern.match(p.name)
@@ -163,7 +159,13 @@ def discover_models():
 
 
 def model_files(window, duration):
-    tag = f"w{window}_td{duration}"
+    # Model filename may include _mh{n} suffix (e.g. w336_td336_mh72).
+    # Glob for the actual file to get the correct full tag.
+    matches = sorted(MODEL_DIR.glob(f"ppo_multi_perp_w{window}_td{duration}*.zip"))
+    if matches:
+        tag = matches[0].stem.replace("ppo_multi_perp_", "")
+    else:
+        tag = f"w{window}_td{duration}"
     return (
         str(MODEL_DIR / f"ppo_multi_perp_{tag}"),
         str(MODEL_DIR / f"vec_normalize_{tag}.pkl"),
