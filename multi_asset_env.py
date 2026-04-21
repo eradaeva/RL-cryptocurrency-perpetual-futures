@@ -152,29 +152,55 @@ ATR_IDX    = FEATURE_COLS.index("atr_14")
 SMA200_IDX = FEATURE_COLS.index("price_vs_sma200")
 SMA500_IDX = FEATURE_COLS.index("price_vs_sma500")
 
-# ── Reward constants (v3.2 — trend alignment) ────────────────────────────────
-# v3.1 raised ENTRY_COST and FEE_SCALE to discourage overtrading.
-# v3.2 adds directional awareness using the existing price_vs_sma500 feature:
-#   • Counter-trend entries are penalised at the moment of entry.
-#   • Wins that were trend-aligned receive a larger R-multiple multiplier.
-#   • Counter-trend wins still receive a reward boost (agent should not be
-#     confused about a correct outcome — it is rewarded, just slightly less
-#     than an aligned win so it learns the direction preference).
-#   • Counter-trend losses: no extra penalty (the standard loss penalty + the
-#     upfront COUNTER_TREND_PENALTY are already a strong deterrent).
+# ── Reward constants (v3.4 — funding-aware reward) ───────────────────────────
+# v3.3 added a per-step trend-holding signal (TREND_HOLD_BONUS/PENALTY).
+# Evaluation of the 5M model revealed a critical blind spot:
 #
-# Neutral zone ±TREND_THRESHOLD: price within 1% of SMA500 → no alignment signal.
-# This avoids penalising choppy sideways markets where direction is ambiguous.
-STEP_SCALE   = 0.002    # flat patience per asset per step
+#   FUNDING RATE WAS COMPLETELY INVISIBLE TO THE REWARD FUNCTION.
+#
+# During the 2020-2021 bull run, the agent correctly went 66-75% LONG on BTC/ETH.
+# Gross PnL was +$1,293. But total funding PAID was -$1,717 — more than the entire
+# starting equity — because bull markets cause futures to trade at a premium and
+# long holders pay the funding rate every 8 hours. The result: -58.9% return
+# despite correct directional calls. The agent was completely blind to this.
+#
+# v3.4 fixes this by adding a per-step FUNDING_SCALE penalty that fires in
+# proportion to the funding payment made (or received) each step.
+# If the agent is paying funding (long in bull / short in bear), it feels this
+# immediately in the reward — not retrospectively via equity decay.
+# If the agent is RECEIVING funding (short in bull / long in bear), it gets a
+# small reward for holding that position.
+#
+# This teaches the agent to:
+#   1. Avoid holding long positions when funding rates are very high.
+#   2. Prefer short positions during high-funding bull markets if the funding
+#      received exceeds the expected price loss.
+#   3. Exit trades when the cumulative funding cost exceeds the paper profit.
+#
+# v3.4 also raises STEP_SCALE 0.002 → 0.004:
+#   The gain-tier bonuses (+0.010 to +0.040 at 5/10/15/20% equity gain) were
+#   dominating the flat patience signal. At 0.002/step, 15 steps of flat patience
+#   matches ENTRY_COST — but the agent could earn 0.040 in a single gain-tier
+#   crossing, making entry always attractive. Doubling STEP_SCALE to 0.004 means
+#   15 steps = 0.060, exceeding ENTRY_COST, and 25 steps = 0.100, making the
+#   agent genuinely prefer selectivity over compulsive trading.
+#
+# v3.4 also tracks cumulative funding paid per trade and deducts it from the
+# trade-close R-multiple, so the reward at close reflects TRUE net profit.
+STEP_SCALE   = 0.004    # flat patience per asset per step (raised from 0.002)
 TRADE_SCALE  = 0.05     # trade-close R-multiple scale
-ENTRY_COST   = 0.030    # selectivity gate (raised from 0.010 — louder early signal)
-FEE_SCALE    = 8.0      # fee amplifier (raised from 5.0 — fees felt more at entry)
+ENTRY_COST   = 0.030    # selectivity gate
+FEE_SCALE    = 8.0      # fee amplifier
+FUNDING_SCALE = 4.0     # NEW v3.4: funding payment amplifier (half of FEE_SCALE)
 SHARPE_SCALE = 0.05     # episode-end Sharpe bonus multiplier
 
-TREND_THRESHOLD        = 0.01   # ±1% neutral zone around SMA500
-COUNTER_TREND_PENALTY  = 0.015  # entry penalty for counter-trend trades
-COUNTER_TREND_WIN_MULT = 1.3    # R-multiple multiplier: counter-trend wins (brave but not ideal)
-TREND_WIN_MULT         = 1.5    # R-multiple multiplier: trend-aligned wins
+TREND_THRESHOLD        = 0.01    # ±1% neutral zone around SMA500
+COUNTER_TREND_PENALTY  = 0.040   # entry penalty for counter-trend trades
+COUNTER_TREND_WIN_MULT = 1.3     # R-multiple multiplier: counter-trend wins
+TREND_WIN_MULT         = 1.5     # R-multiple multiplier: trend-aligned wins
+
+TREND_HOLD_BONUS       = 0.0008  # per-step bonus for holding trend-aligned position
+TREND_HOLD_PENALTY     = 0.0008  # per-step penalty for holding counter-trend position
 
 MAX_PORTFOLIO_LEVERAGE = 6.0    # hard cap on sum(|positions|) across all assets
 
@@ -307,6 +333,7 @@ class MultiAssetPerpEnv(gym.Env):
         self.equity_at_entries = [self.equity]   * self.n_assets
         self.just_entered      = [False]         * self.n_assets
         self.was_counter_trend = [False]         * self.n_assets
+        self.trade_funding_paid = [0.0]          * self.n_assets  # v3.4: cumulative funding per trade
 
         # ── Portfolio gain tier tracking (resettable triggers) ────────────────
         self.gain_tiers_claimed = [False] * 4
@@ -438,6 +465,7 @@ class MultiAssetPerpEnv(gym.Env):
                     self.trade_entry_steps[i] = self.idx
                     self.trade_states[i]      = IN_TRADE
                     self.just_entered[i]      = True
+                    self.trade_funding_paid[i] = 0.0  # v3.4: reset per-trade funding tracker
 
                     if direction == DIR_LONG:
                         self.sl_prices[i] = current_price - sl_distance
@@ -502,6 +530,29 @@ class MultiAssetPerpEnv(gym.Env):
                     self.trade_states[i]  = FLAT
                     trade_closed          = True
 
+                else:
+                    # ── Trend-holding signal (v3.3) ───────────────────────────
+                    # Fires every step while in a trade that has NOT just closed.
+                    # Reads the current SMA500 regime and checks whether the
+                    # open position direction aligns with it.
+                    # Neutral zone: no signal (avoids penalising choppy markets).
+                    # This accumulates over the trade duration — a 90-step
+                    # counter-trend hold costs 90 × 0.0008 = 0.072 in penalties,
+                    # larger than ENTRY_COST, making the agent learn to avoid
+                    # holding positions against the prevailing trend.
+                    sma500_now = float(self.features[i][self.idx, SMA500_IDX])
+                    if sma500_now > TREND_THRESHOLD:        # bull regime
+                        if self.trade_directions[i] == DIR_LONG:
+                            bonus   += TREND_HOLD_BONUS     # holding with trend
+                        else:
+                            penalty += TREND_HOLD_PENALTY   # holding against trend
+                    elif sma500_now < -TREND_THRESHOLD:     # bear regime
+                        if self.trade_directions[i] == DIR_SHORT:
+                            bonus   += TREND_HOLD_BONUS     # holding with trend
+                        else:
+                            penalty += TREND_HOLD_PENALTY   # holding against trend
+                    # else: neutral zone — no holding signal
+
             # ── Price mechanics for this asset ────────────────────────────────
             next_price   = self.prices[i][next_idx]
             price_return = (next_price - current_price) / (current_price + 1e-8)
@@ -513,6 +564,18 @@ class MultiAssetPerpEnv(gym.Env):
             total_pnl     += self.positions[i] * self.equity * price_return
             total_fees    += step_fee
             total_funding += funding_payment
+
+            # ── v3.4: Per-step funding penalty ────────────────────────────────
+            # funding_payment is negative when agent PAYS (long in bull, short in bear)
+            # and positive when agent RECEIVES. We add it directly as a signed reward
+            # signal so the agent learns to avoid high-payment funding situations.
+            # FUNDING_SCALE = 4.0 (half of FEE_SCALE) — substantial but not overwhelming.
+            if abs(self.positions[i]) > 0.01:   # only while in a trade
+                funding_norm = (funding_payment / (self.equity + 1e-8)) * FUNDING_SCALE
+                bonus += funding_norm   # negative payment → reduces bonus (penalty effect)
+                                        # positive receipt → increases bonus (reward effect)
+                # Track cumulative funding paid this trade for R-multiple correction at close
+                self.trade_funding_paid[i] += funding_payment
 
             # ── Per-asset reward components (isolated — no cross-asset contamination)
 
@@ -541,8 +604,15 @@ class MultiAssetPerpEnv(gym.Env):
                 else:
                     raw_return = (self.entry_prices[i] - exit_price) / (self.entry_prices[i] + 1e-8)
 
-                r_multiple = raw_return * abs(self.positions[i]) / (self.trade_risk_pcts[i] / 100.0 + 1e-8)
+                # v3.4: deduct cumulative funding paid from the price-based return
+                # so the R-multiple reflects TRUE net profit (price move - funding drag).
+                equity_ref = max(self.equity_at_entries[i], 1e-6)
+                funding_drag = self.trade_funding_paid[i] / equity_ref   # signed: negative = paid
+                net_return = raw_return + funding_drag   # funding drag reduces winner, amplifies loser
+
+                r_multiple = net_return * abs(self.positions[i]) / (self.trade_risk_pcts[i] / 100.0 + 1e-8)
                 r_clipped  = float(np.clip(r_multiple, -3.0, 5.0))
+                self.trade_funding_paid[i] = 0.0   # clear for next trade
 
                 # Update streak counter (used for observation, not reward)
                 if raw_return > 0:

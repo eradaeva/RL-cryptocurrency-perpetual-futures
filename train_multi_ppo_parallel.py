@@ -1,25 +1,30 @@
 """
 train_multi_ppo_parallel.py  --  Multi-asset PPO (CPU-parallel, SubprocVecEnv)
 ===============================================================================
-Swing-trader configuration -- v3.2 reward, w336/td336 winner.
+Final PPO configuration -- v3.3 reward, w168/td168/mh48 winner.
 
 Smoke test verdict (Apr 2026):
-  All short-window configs (w24, w96, w168 with td48/td168) showed fee drag
-  3000%+ or near-wipeout at 500k steps. w336/td336 was the only config to
-  produce a positive OOS return (+9.4%, $1,093 from $1,000) at 500k steps.
+  v3.2 smoke: w336/td336 was the only profitable config (+9.4% OOS at 500k).
+  v3.3 smoke: w168/td168/mh48 posted +20.4% OOS at 500k -- best result ever.
 
-  Why w336/td336 wins:
-    - 2-week context window gives the agent enough bars to interpret
-      price_vs_sma500 and the v3.2 trend alignment reward meaningfully.
-    - 2-week max hold (td=336) prevents forced premature exits and the
-      re-entry churn cycle that caused 3000%+ fee drag in short-td configs.
-    - min_hold=72 gives trades room to breathe before SL/TP can fire.
-    - [512,256] network compresses the 26,910-dim observation space.
+  Why v3.3 fixed the direction problem:
+    - v3.2 only penalised counter-trend entries (one-shot at open).
+    - Agent still held counter-trend positions for 90+ hours with no feedback.
+    - v3.3 adds TREND_HOLD_PENALTY/BONUS: 0.0008 per step while IN_TRADE.
+    - A 90-step counter-trend hold now costs 0.072 in accumulated penalty --
+      larger than ENTRY_COST itself. Agent cannot afford to fight the trend.
+    - COUNTER_TREND_PENALTY also raised 0.015 -> 0.040 at entry.
 
-  5M steps chosen over 3M because:
-    - 10x larger obs space + 25x more network parameters vs previous configs.
-    - Trend alignment reward needs many completed trades to shape the policy.
-    - With min_hold=72 and td=336, fewer trades per episode -> need more episodes.
+  Why w168/td168/mh48 over w336/td336/mh72:
+    - w336 + mh72 conflicts with holding signal: agent locked in 72 steps
+      minimum, accumulating penalty it cannot act on -> noisy gradients.
+    - w168/td168/mh48: shorter holds mean holding signal is proportional
+      and actionable. Agent learns direction correctly at 500k steps.
+    - [256,256] network on 13,470-dim obs: faster training, more updates
+      per hour, converges better at 5M steps.
+
+  5M steps: same as previous run. Network is smaller so expect faster
+  wall-clock time (~5-6h vs ~8h for [512,256]).
 
 Parallelism -- SubprocVecEnv:
   4 envs x 512 steps = 2048 transitions per rollout.
@@ -62,9 +67,9 @@ ASSET_NAMES = ["BTC", "ETH", "SOL", "BNB"]
 WINDOW_SIZE    = 336        # 2-week context window
 TRADE_DURATION = 336        # 2-week max hold
 MIN_HOLD_STEPS = 72         # 3-day minimum hold before SL/TP can fire
-NET_ARCH       = [512, 256] # network sized for 26,910-dim obs space
+NET_ARCH       = [512, 256] # network sized for 26,903-dim obs space
 
-TOTAL_STEPS    = 5_000_000  # 5M -- needed for [512,256] net on 26k-dim obs
+TOTAL_STEPS    = 5_000_000  # 5M steps -- v3.3 trend-holding reward
 TRAIN_END_DATE = "2023-12-31"
 FEE_RATE       = 0.0005
 MAX_LEVERAGE   = 3.0
@@ -189,12 +194,12 @@ if __name__ == "__main__":
     print("  PPO Multi-Asset -- Swing Trader -- 5M steps")
     print("=" * 70)
     print(f"  Config       : w{WINDOW_SIZE} / td{TRADE_DURATION} / min_hold={MIN_HOLD_STEPS}")
-    print(f"  Network      : {NET_ARCH}  (obs ~26,910 dims)")
+    print(f"  Network      : {NET_ARCH}  (obs ~26,903 dims)")
     print(f"  Total steps  : {TOTAL_STEPS:,}")
     print(f"  Workers      : {N_ENVS}  x  {N_STEPS} n_steps/env  =  {N_ENVS*N_STEPS}/rollout")
     print(f"  Assets       : {ASSET_NAMES}")
     print(f"  Train period : up to {TRAIN_END_DATE}")
-    print(f"  Reward       : v3.2 (trend alignment via price_vs_sma500)")
+    print(f"  Reward       : v3.4 (trend-hold + funding-aware)")
     print(f"  Model out    : {model_path}.zip")
     print("=" * 70)
 

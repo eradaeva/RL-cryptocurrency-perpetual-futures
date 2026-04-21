@@ -50,15 +50,13 @@ MODEL_DIR   = Path("ppo_multi_perp")   # SAC models saved here alongside PPO
 SEED        = 42
 FEE_RATE    = 0.0005
 MAX_LEV     = 3.0
-MIN_HOLD    = 12
+MIN_HOLD    = 72   # matches PPO winner for fair comparison
 INIT_EQUITY = 1_000.0
 
 # Set to a list of (window, duration) tuples to evaluate specific models only.
 # Set to None to evaluate every SAC model found in MODEL_DIR.
 EVAL_CONFIGS = [
-    (168, 168),   # mirrors single-asset winner
-    ( 96,  48),   # best drawdown in original grid
-    ( 24, 168),   # best Sharpe in original grid
+    (336, 336),   # matches PPO winner (w336/td336/mh72) for direct comparison
 ]
 
 PERIODS = [

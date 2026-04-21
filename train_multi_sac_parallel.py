@@ -34,7 +34,7 @@ import gc
 import time
 import pandas as pd
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from multi_asset_env import MultiAssetPerpEnv
 
@@ -57,20 +57,18 @@ ASSET_NAMES = ["BTC", "ETH", "SOL", "BNB"]
 # ── Configs ───────────────────────────────────────────────────────────────────
 
 CONFIGS = [
-    (168, 168),   # mirrors single-asset winner
-    ( 96,  48),   # best drawdown in PPO grid
-    ( 24, 168),   # best Sharpe in PPO grid
+    (336, 336),   # matches PPO winner (w336/td336/mh72) for direct comparison
 ]
 
-TOTAL_STEPS    = 3_000_000
+TOTAL_STEPS    = 5_000_000
 TRAIN_END_DATE = "2023-12-31"
 FEE_RATE       = 0.0005
 MAX_LEVERAGE   = 3.0
-MIN_HOLD_STEPS = 24   # raised from 12 — forces commitment, halves max trade frequency
+MIN_HOLD_STEPS = 72   # matches PPO winner min_hold for fair comparison
 
 MODEL_DIR = "ppo_multi_perp"
 LOG_DIR   = "training_log_multi"
-PRINT_EVERY = 100_000
+PRINT_EVERY = 25_000    # print more often so we can see it's actually running
 
 
 # ── Progress callback ─────────────────────────────────────────────────────────
@@ -188,16 +186,16 @@ def train_one(window, duration, model_idx, total_models):
         device           = "cpu",
         verbose          = 0,
         learning_rate    = 3e-4,
-        buffer_size      = 1_000_000,
-        learning_starts  = 10_000,
+        buffer_size      = 50_000,    # 26903-dim obs = ~216KB/transition; 50k = ~10.5GB
+        learning_starts  = 5_000,
         batch_size       = 256,
         tau              = 0.005,
         gamma            = 0.99,
-        train_freq       = 1,
-        gradient_steps   = N_ENVS,   # 1 grad step per transition collected
+        train_freq       = (4, "step"),   # update every 4 steps (not every step)
+        gradient_steps   = 1,             # 1 grad update per train call (was N_ENVS=4)
         ent_coef         = "auto",
         target_entropy   = "auto",
-        policy_kwargs    = dict(net_arch=[256, 256]),
+        policy_kwargs    = dict(net_arch=[256, 256]),   # smaller net for CPU feasibility
         seed             = 42,
     )
 
@@ -210,7 +208,16 @@ def train_one(window, duration, model_idx, total_models):
         print_every  = PRINT_EVERY,
     )
 
-    model.learn(total_timesteps=TOTAL_STEPS, callback=cb)
+    checkpoint_cb = CheckpointCallback(
+        save_freq   = 500_000,
+        save_path   = "sac_checkpoints",
+        name_prefix = f"sac_multi_perp_w{window}_td{duration}",
+        save_replay_buffer = False,   # replay buffer is ~10GB — too large to checkpoint
+        save_vecnormalize  = False,
+        verbose     = 1,
+    )
+
+    model.learn(total_timesteps=TOTAL_STEPS, callback=[cb, checkpoint_cb])
     model.save(model_path)
 
     del model, env
@@ -222,8 +229,9 @@ def train_one(window, duration, model_idx, total_models):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR,   exist_ok=True)
+    os.makedirs(MODEL_DIR,        exist_ok=True)
+    os.makedirs(LOG_DIR,          exist_ok=True)
+    os.makedirs("sac_checkpoints", exist_ok=True)
 
     total_models    = len(CONFIGS)
     total_steps_all = total_models * TOTAL_STEPS

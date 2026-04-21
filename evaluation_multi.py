@@ -50,7 +50,7 @@ INIT_EQUITY = 1_000.0
 # Set to a list of (window, duration) tuples to evaluate specific models only.
 # Set to None to evaluate every model found in MODEL_DIR (full 16-model grid).
 EVAL_CONFIGS = [
-    (336, 336),   # swing-trader winner (smoke test Apr 2026)
+    (336, 336),   # v3.4 winner (w336/td336/mh72 — 5M steps)
 ]
 
 PERIODS = [
@@ -145,25 +145,29 @@ def compute_btc_bnh(eval_start, eval_end):
 # ── Model discovery ────────────────────────────────────────────────────────────
 
 def discover_models():
-    """Return sorted list of (window, duration) tuples to evaluate.
-    Respects EVAL_CONFIGS filter if set; otherwise returns all found models."""
+    """Return deduplicated sorted list of (window, duration) tuples to evaluate.
+    Respects EVAL_CONFIGS filter if set; otherwise returns all found models.
+    Deduplication: multiple files matching the same (w, td) — e.g. w168_td168.zip
+    and w168_td168_mh48.zip — count as one config (model_files picks the best one)."""
     pattern = re.compile(r"ppo_multi_perp_w(\d+)_td(\d+)(?:_mh\d+)?\.zip$")
-    found   = []
+    found   = set()
     for p in sorted(MODEL_DIR.glob("ppo_multi_perp_w*_td*.zip")):
         m = pattern.match(p.name)
         if m:
-            found.append((int(m.group(1)), int(m.group(2))))
+            found.add((int(m.group(1)), int(m.group(2))))
+    found = sorted(found)
     if EVAL_CONFIGS is not None:
         found = [cfg for cfg in found if cfg in EVAL_CONFIGS]
-    return sorted(found)
+    return found
 
 
 def model_files(window, duration):
-    # Model filename may include _mh{n} suffix (e.g. w336_td336_mh72).
-    # Glob for the actual file to get the correct full tag.
+    # Model filename may include _mh{n} suffix (e.g. w168_td168_mh48).
+    # Pick the LAST match alphabetically — _mh suffix sorts after the bare name,
+    # so this preferentially picks the most recent versioned model.
     matches = sorted(MODEL_DIR.glob(f"ppo_multi_perp_w{window}_td{duration}*.zip"))
     if matches:
-        tag = matches[0].stem.replace("ppo_multi_perp_", "")
+        tag = matches[-1].stem.replace("ppo_multi_perp_", "")
     else:
         tag = f"w{window}_td{duration}"
     return (
